@@ -1,0 +1,17 @@
+{
+  "name": "whatsapp-scraper-cloud",
+  "version": "1.0.0",
+  "description": "WhatsApp group scraper - cloud version",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "whatsapp-web.js": "^1.26.0",
+    "qrcode": "^1.5.4",
+    "express": "^4.19.0"
+  }
+}
