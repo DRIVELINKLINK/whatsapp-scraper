@@ -150,7 +150,7 @@ app.get('/api/status', (req, res) => {
   res.json({ status: state.status, group: state.groupName, messageCount: state.messageCount });
 });
 
-app.listen(PORT, () => console.log(`🌐 שרת רץ על פורט ${PORT}`));
+app.listen(PORT, '0.0.0.0', () => console.log(`🌐 שרת רץ על פורט ${PORT}`));
 
 // ── WhatsApp Client ──────────────────────────
 function initClient() {
