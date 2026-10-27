@@ -1,0 +1,15 @@
+services:
+  collector:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATA_DIR: /data
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/data
+    shm_size: "1gb"
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }

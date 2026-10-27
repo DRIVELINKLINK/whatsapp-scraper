@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "WhatsApp Collector – ניטור הודעות",
+  "version": "1.2.0",
+  "description": "קולט קבוצות והודעות חדשות מ-WhatsApp Web ושולח אותן לאפליקציית WhatsApp Collector.",
+  "permissions": ["storage", "alarms"],
+  "host_permissions": ["https://xxbstgdhtlalremiftwf.supabase.co/*"],
+  "background": { "service_worker": "bg.js" },
+  "content_scripts": [
+    {
+      "matches": ["https://web.whatsapp.com/*"],
+      "js": ["main.js"],
+      "world": "MAIN",
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://web.whatsapp.com/*"],
+      "js": ["relay.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
