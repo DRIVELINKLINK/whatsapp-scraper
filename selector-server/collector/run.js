@@ -26,6 +26,7 @@ function buildExtension() {
   fs.rmSync(EXT, { recursive: true, force: true });
   fs.mkdirSync(EXT, { recursive: true });
   for (const f of fs.readdirSync(EXT_SRC)) {
+    if (!fs.statSync(path.join(EXT_SRC, f)).isFile()) continue;
     let text = fs.readFileSync(path.join(EXT_SRC, f), "utf8");
     if (f === "bg.js") text = text.replace("__SUPABASE_KEY__", KEY);
     if (f === "main.js") text = text.replace('const VERSION = "1.2.0";', 'const VERSION = "1.2.0-server";');
@@ -63,18 +64,23 @@ async function run() {
   buildExtension();
   fs.mkdirSync(PROFILE, { recursive: true });
   context = await chromium.launchPersistentContext(PROFILE, {
-    headless: false, // runs inside a virtual display (xvfb); extensions need a real browser window
+    // Real browser window inside a virtual display (xvfb). HEADLESS=1 is only for local tests.
+    headless: process.env.HEADLESS === "1",
+    ...(process.env.HEADLESS === "1" ? { channel: "chromium" } : {}),
     viewport: { width: 1280, height: 900 },
     args: [`--disable-extensions-except=${EXT}`, `--load-extension=${EXT}`, "--no-sandbox", "--disable-dev-shm-usage"],
   });
+  let dead = "";
+  context.on("close", () => { dead = "browser closed"; });
   const page = context.pages()[0] || (await context.newPage());
+  page.on("crash", () => { dead = "page crashed"; });
   page.on("console", (m) => { if (m.text().includes("WA Collector")) console.log("[page]", m.text()); });
-  await page.goto("https://web.whatsapp.com", { waitUntil: "domcontentloaded", timeout: 120000 });
+  await page.goto(process.env.WA_URL || "https://web.whatsapp.com", { waitUntil: "domcontentloaded", timeout: 120000 });
   setState("loading");
 
   let lastConnected = 0;
   for (;;) {
-    if (page.isClosed()) throw new Error("page closed");
+    if (dead || page.isClosed()) throw new Error(dead || "page closed");
     const connected = await page.locator("#pane-side").count().catch(() => 0);
     if (connected) {
       lastConnected = Date.now();
@@ -84,9 +90,9 @@ async function run() {
       if (qr) { setState("qr"); await page.screenshot({ path: QR_FILE }).catch(() => {}); }
       else if (state.status !== "connected" || Date.now() - lastConnected > 120000) setState("loading");
       // Stuck without chats for 10 minutes after having been connected → reload WhatsApp Web.
-      if (lastConnected && Date.now() - lastConnected > 600000) { lastConnected = Date.now(); await page.reload().catch(() => {}); }
+      if (lastConnected && Date.now() - lastConnected > 600000) { lastConnected = Date.now(); await page.reload({ timeout: 120000 }).catch(() => {}); }
     }
-    await new Promise((r) => setTimeout(r, 5000));
+    await new Promise((r) => setTimeout(r, Number(process.env.POLL_MS || 5000)));
   }
 }
 

@@ -5,10 +5,17 @@ DIR=/opt/wa-selector
 BRANCH=selector-server
 
 echo "== מתקין Docker (אם חסר) =="
+apt-get update -qq && apt-get install -y -qq git curl >/dev/null
 if ! command -v docker >/dev/null; then
   curl -fsSL https://get.docker.com | sh
 fi
-apt-get install -y git >/dev/null
+
+# 2GB swap as a safety net for Chromium (only once)
+if ! swapon --show | grep -q /swapfile; then
+  [ -f /swapfile ] || { fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile >/dev/null; }
+  swapon /swapfile || true
+  grep -q /swapfile /etc/fstab || echo "/swapfile none swap sw 0 0" >> /etc/fstab
+fi
 
 echo "== מוריד את הקוד =="
 if [ -d "$DIR/.git" ]; then git -C "$DIR" fetch origin "$BRANCH" && git -C "$DIR" checkout "$BRANCH" && git -C "$DIR" pull --ff-only
