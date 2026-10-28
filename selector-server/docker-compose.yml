@@ -14,3 +14,12 @@ services:
     logging:
       driver: json-file
       options: { max-size: "10m", max-file: "3" }
+
+  worker:
+    build: ./worker
+    restart: unless-stopped
+    init: true
+    env_file: .env
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }

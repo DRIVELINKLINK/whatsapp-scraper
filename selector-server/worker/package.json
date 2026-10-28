@@ -1,0 +1,8 @@
+{
+  "name": "wa-selector-worker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Sends ready WhatsApp Selector rides to DriveLink (server-side)",
+  "scripts": { "start": "tsx worker.ts" },
+  "dependencies": { "tsx": "4.23.15" }
+}
