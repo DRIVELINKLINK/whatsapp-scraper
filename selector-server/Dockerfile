@@ -8,4 +8,5 @@ RUN npm install --omit=dev && npx playwright install --with-deps chromium \
 COPY extension /app/extension
 COPY collector/run.js ./
 EXPOSE 8080
-CMD ["xvfb-run", "-a", "-s", "-screen 0 1280x900x24", "node", "run.js"]
+ENV DISPLAY=:99
+CMD ["sh", "-c", "rm -f /tmp/.X99-lock; Xvfb :99 -screen 0 1280x900x24 -nolisten tcp >/dev/null 2>&1 & sleep 1; exec node run.js"]
