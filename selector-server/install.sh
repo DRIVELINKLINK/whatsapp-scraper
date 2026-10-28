@@ -29,7 +29,7 @@ if [ ! -f .env ]; then
   KEY=$(printf '%s' "$KEY" | grep -o 'sb_publishable_[A-Za-z0-9_-]*' | head -1 || true)   # ignore paste garbage
   PASS=$(printf '%s' "$PASS" | sed -e 's/\x1b\[20[01]~//g' -e 's/\^\[\[20[01]~//g')
   case "$KEY" in sb_publishable_*) ;; *) echo "המפתח לא נראה תקין ($KEY). הריצו שוב."; exit 1;; esac
-  if [ -z "$PASS" ]; then PASS="wa$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 10)"; fi
+  if [ -z "$PASS" ]; then PASS="wa$( (tr -dc 'A-Za-z0-9' </dev/urandom | head -c 10) || true)"; fi
   echo "סיסמת דף ה-QR: $PASS   (רשמו אותה)"
   printf 'SUPABASE_KEY=%s\nQR_PASSWORD=%s\n' "$KEY" "$PASS" > .env
   chmod 600 .env
