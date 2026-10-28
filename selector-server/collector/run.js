@@ -43,11 +43,12 @@ function startQrServer() {
         res.writeHead(401, { "WWW-Authenticate": 'Basic realm="WhatsApp Selector"' });
         return res.end("Unauthorized");
       }
-      if (req.url === "/qr.png" && fs.existsSync(QR_FILE)) {
+      const pathname = (req.url || "/").split("?")[0];
+      if (pathname === "/qr.png" && fs.existsSync(QR_FILE)) {
         res.writeHead(200, { "Content-Type": "image/png", "Cache-Control": "no-store" });
         return fs.createReadStream(QR_FILE).pipe(res);
       }
-      if (req.url === "/status") {
+      if (pathname === "/status") {
         res.writeHead(200, { "Content-Type": "application/json" });
         return res.end(JSON.stringify(state));
       }
