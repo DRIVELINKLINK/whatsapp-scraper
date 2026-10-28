@@ -26,6 +26,9 @@ if [ ! -f .env ]; then
   echo "== הגדרות (נשמרות רק בשרת) =="
   read -rp "מפתח Supabase של הסלקטור (sb_publishable_...): " KEY
   read -rsp "סיסמה לדף סריקת ה-QR: " PASS; echo
+  KEY=$(printf '%s' "$KEY" | sed 's/\x1b\[20[01]~//g' | tr -cd 'A-Za-z0-9_-')   # drop paste garbage
+  PASS=$(printf '%s' "$PASS" | sed 's/\x1b\[20[01]~//g')
+  case "$KEY" in sb_publishable_*) ;; *) echo "המפתח לא נראה תקין ($KEY). הריצו שוב."; exit 1;; esac
   printf 'SUPABASE_KEY=%s\nQR_PASSWORD=%s\n' "$KEY" "$PASS" > .env
   chmod 600 .env
 fi
