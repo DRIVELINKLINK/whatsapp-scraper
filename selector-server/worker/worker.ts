@@ -105,6 +105,88 @@ type Msg = { id: string; group_id: string | null; group_name: string | null; bod
 type Override = { message_id: string; origin: string | null; destination: string | null; phone_choice: string | null; dismissed_at: string | null; price: number | null; ride_time: string | null; notes: string | null; phone: string | null; wa_link: string | null; tg_link: string | null; approved_at: string | null };
 type Transfer = { message_id: string; status: string; attempts: number };
 
+// ---------- Incremental loading (keeps Supabase traffic small) ----------
+const FULL_MESSAGES_MS = 30 * 60_000;
+const FULL_SMALL_MS = 10 * 60_000;
+const CONFIG_MS = 60_000;
+const MSG_COLS = "id,group_id,group_name,body,timestamp,sender_name,sender_phone,is_duplicate,created_at";
+type CachedMsg = Msg & { created_at: string };
+const msgCache = new Map<string, CachedMsg>();
+let msgState = { at: 0, groups: "", from: "", lastCreated: "" };
+async function fetchMessages(ids: string[], filter: string): Promise<CachedMsg[]> {
+  const out: CachedMsg[] = [];
+  for (let i = 0; i < ids.length; i += 100) {
+    const chunk = ids.slice(i, i + 100);
+    out.push(...await sbAll<CachedMsg>(`wa_messages?select=${MSG_COLS}&is_duplicate=eq.false&${filter}&group_id=in.${encodeURIComponent(inList(chunk))}&order=created_at.asc`));
+  }
+  return out;
+}
+async function loadMessages(ids: string[], from: string): Promise<Msg[]> {
+  const groupsKey = ids.join(",");
+  const full = !msgState.lastCreated || Date.now() - msgState.at > FULL_MESSAGES_MS || groupsKey !== msgState.groups || from < msgState.from;
+  if (full) {
+    msgCache.clear();
+    for (const m of await fetchMessages(ids, `timestamp=gte.${encodeURIComponent(from)}`)) msgCache.set(m.id, m);
+    msgState = { at: Date.now(), groups: groupsKey, from, lastCreated: "" };
+  } else {
+    // New rows only; a 2-minute overlap catches inserts that committed out of order.
+    const after = new Date(Date.parse(msgState.lastCreated) - 120_000).toISOString();
+    for (const m of await fetchMessages(ids, `created_at=gt.${encodeURIComponent(after)}&timestamp=gte.${encodeURIComponent(from)}`)) msgCache.set(m.id, m);
+    msgState.from = from;
+  }
+  let last = msgState.lastCreated;
+  for (const [id, m] of msgCache) {
+    if (!m.timestamp || m.timestamp < from) { msgCache.delete(id); continue; }
+    if (m.created_at > last) last = m.created_at;
+  }
+  msgState.lastCreated = last || new Date().toISOString();
+  return [...msgCache.values()].sort((a, b) => (b.timestamp ?? "").localeCompare(a.timestamp ?? ""));
+}
+
+let configCache: { at: number; aliasRows: PlaceAlias[]; keywords: PhoneKeyword[]; noteFilters: NoteFilter[] } | null = null;
+async function loadConfig() {
+  if (configCache && Date.now() - configCache.at < CONFIG_MS) return configCache;
+  const [aliasRows, keywordRows, filterRows] = await Promise.all([
+    sbAll<PlaceAlias>("wa_place_aliases?select=alias,official_name,is_display,keep_in_notes,use_for_parse,is_hero&order=alias"),
+    sbAll<PhoneKeyword>("wa_phone_keywords?select=phrase,kind&order=phrase"),
+    sbAll<NoteFilter>("wa_note_filters?select=phrase,kind&order=phrase"),
+  ]);
+  configCache = {
+    at: Date.now(), aliasRows,
+    keywords: keywordRows.filter((k) => k.kind === "dispatcher" || k.kind === "ignore"),
+    noteFilters: filterRows.filter((f) => f.kind === "line" || f.kind === "link"),
+  };
+  return configCache;
+}
+
+const overrideCache = new Map<string, Override & { updated_at?: string }>();
+let overrideState = { at: 0, last: "" };
+async function loadOverrides() {
+  if (!overrideState.last || Date.now() - overrideState.at > FULL_SMALL_MS) {
+    overrideCache.clear();
+    for (const o of await sbAll<Override & { updated_at: string }>("wa_ride_overrides?select=*")) overrideCache.set(o.message_id, o);
+    overrideState.at = Date.now();
+  } else {
+    const after = new Date(Date.parse(overrideState.last) - 120_000).toISOString();
+    for (const o of await sbAll<Override & { updated_at: string }>(`wa_ride_overrides?select=*&updated_at=gt.${encodeURIComponent(after)}`)) overrideCache.set(o.message_id, o);
+  }
+  let last = overrideState.last;
+  for (const o of overrideCache.values()) if (o.updated_at && o.updated_at > last) last = o.updated_at;
+  overrideState.last = last || new Date(0).toISOString();
+  return overrideCache;
+}
+
+const transferCache = new Map<string, Transfer>();
+let transferAt = 0;
+async function loadTransfers() {
+  if (!transferAt || Date.now() - transferAt > FULL_SMALL_MS) {
+    transferCache.clear();
+    for (const t of await sbAll<Transfer>(`wa_transfers?select=message_id,status,attempts&sent_at=gte.${encodeURIComponent(new Date(Date.now() - 2 * DAY).toISOString())}`)) transferCache.set(t.message_id, t);
+    transferAt = Date.now();
+  }
+  return transferCache;
+}
+
 export async function cycle() {
   const settings = (await sb<{ auto_transfer: boolean; auto_transfer_since: string | null }[]>("wa_display_settings?id=eq.main&select=auto_transfer,auto_transfer_since"))[0];
   if (!settings?.auto_transfer || !settings.auto_transfer_since) return { skipped: "auto transfer is off" };
@@ -114,25 +196,11 @@ export async function cycle() {
   const groups = await sbAll<{ id: string; name: string }>("wa_groups?select=id,name&enabled=eq.true&pending_review=eq.false&order=id");
   if (!groups.length) return { skipped: "no active groups" };
   const groupName = new Map(groups.map((g) => [g.id, g.name]));
-  const messages: Msg[] = [];
-  for (let i = 0; i < groups.length; i += 100) {
-    const ids = groups.slice(i, i + 100).map((g) => g.id);
-    messages.push(...await sbAll<Msg>(`wa_messages?select=id,group_id,group_name,body,timestamp,sender_name,sender_phone,is_duplicate&is_duplicate=eq.false&timestamp=gte.${encodeURIComponent(from)}&group_id=in.${encodeURIComponent(inList(ids))}&order=timestamp.desc`));
-  }
+  const messages = await loadMessages(groups.map((g) => g.id), from);
   if (!messages.length) return { messages: 0 };
 
-  const [aliasRows, keywordRows, filterRows, overrides, transfers, place] = await Promise.all([
-    sbAll<PlaceAlias & { id: string }>("wa_place_aliases?select=alias,official_name,is_display,keep_in_notes,use_for_parse,is_hero&order=alias"),
-    sbAll<PhoneKeyword>("wa_phone_keywords?select=phrase,kind&order=phrase"),
-    sbAll<NoteFilter>("wa_note_filters?select=phrase,kind&order=phrase"),
-    sbAll<Override>("wa_ride_overrides?select=*"),
-    sbAll<Transfer>(`wa_transfers?select=message_id,status,attempts&sent_at=gte.${encodeURIComponent(new Date(Date.now() - 2 * DAY).toISOString())}`),
-    getPlaces(),
-  ]);
-  const keywords = keywordRows.filter((k) => k.kind === "dispatcher" || k.kind === "ignore");
-  const noteFilters = filterRows.filter((f) => f.kind === "line" || f.kind === "link");
-  const overrideMap = new Map(overrides.map((o) => [o.message_id, o]));
-  const transferMap = new Map(transfers.map((t) => [t.message_id, t]));
+  const [config, overrideMap, transferMap, place] = await Promise.all([loadConfig(), loadOverrides(), loadTransfers(), getPlaces()]);
+  const { aliasRows, keywords, noteFilters } = config;
 
   // buildBase (same as useRideBoard)
   const base = messages.map((message) => {
@@ -207,6 +275,7 @@ export async function cycle() {
     sent_at: new Date().toISOString(),
   }));
   await sb("wa_transfers?on_conflict=message_id", { method: "POST", headers: { Prefer: "resolution=merge-duplicates,return=minimal" }, body: JSON.stringify(rows) });
+  for (const r of rows) transferCache.set(r.message_id, { message_id: r.message_id, status: r.status, attempts: r.attempts });
   return { ready: ready.length, sent: rows.filter((r) => r.status === "sent").length, duplicate: rows.filter((r) => r.status === "duplicate").length, errors: rows.filter((r) => r.status === "error").map((r) => r.error) };
 }
 
