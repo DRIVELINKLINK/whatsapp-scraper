@@ -228,7 +228,24 @@ async function loadTransfers() {
   return transferCache;
 }
 
+// ---------- Two loops: "process" (read, parse, split, remove, queue) and "send" (one ride every INTERVAL) ----------
+// Sending never waits for the heavy processing, so the gap between rides stays exactly INTERVAL.
+type Payload = ReturnType<typeof toDriveLinkRide>;
+let readyQueue: Payload[] = [];
+export const stats = { cycleMs: 0, queue: 0, lastSendAt: 0 };
+
 export async function cycle() {
+  const processed = await processCycle();
+  const sent = await sendNext();
+  return { ...processed, ...sent };
+}
+
+export async function processCycle() {
+  const started = Date.now();
+  try { return await processInner(); } finally { stats.cycleMs = Date.now() - started; }
+}
+
+async function processInner() {
   const settings = (await rpc<WorkerConfig>("worker_config", {})).settings;
   // Splitting and auto-removal always run; only the sending to DriveLink depends on the switch.
   const sending = Boolean(settings?.auto_transfer && settings.auto_transfer_since);
@@ -249,7 +266,8 @@ export async function cycle() {
   const byId = new Map(messages.map((m) => [m.id, m]));
 
   // buildBase (same as useRideBoard)
-  const configKey = JSON.stringify([aliasRows.length, customPlaces.length, keywords, noteFilters, place.official.length, config.at]);
+  // Re-parse only when the content of the settings changes (not on every minute's reload).
+  const configKey = JSON.stringify([aliasRows, customPlaces, keywords, noteFilters, place.official.length]);
   const base = messages.map((message) => {
     const o = overrideMap.get(message.id);
     const parent = message.split_of ? byId.get(message.split_of) : null;
@@ -369,7 +387,7 @@ export async function cycle() {
     for (const d of toDismiss) overrideCache.set(d.message_id, { ...(overrideCache.get(d.message_id) ?? emptyOverride(d.message_id)), dismissed_at: d.dismissed_at, dismiss_kind: "auto" });
     log("auto removed:", toDismiss.length, "rides");
   }
-  if (!sending) return { messages: messages.length, split: splitCount, removed: toDismiss.length, skipped: "auto transfer is off" };
+  if (!sending) { readyQueue = []; stats.queue = 0; return { messages: messages.length, split: splitCount, removed: toDismiss.length, skipped: "auto transfer is off" }; }
 
   const ready = [];
   for (const full of marked) {
@@ -381,16 +399,31 @@ export async function cycle() {
     if (!autoEligible(full, since)) continue;
     ready.push(full);
   }
-  if (!ready.length) return { messages: messages.length, split: splitCount, removed: toDismiss.length, ready: 0 };
-
   // Oldest waiting ride first, so nothing is starved behind newer messages.
   ready.sort((a, b) => (a.message.timestamp ?? "").localeCompare(b.message.timestamp ?? ""));
-  const batch = ready.slice(0, Math.min(PER_CYCLE, MAX_RIDES_PER_CALL)).map((r) => toDriveLinkRide(r, { notesTemplate: settings?.notes_template ?? null, aliases: aliasRows }))
+  readyQueue = ready.map((r) => toDriveLinkRide(r, { notesTemplate: settings?.notes_template ?? null, aliases: aliasRows }))
     // DriveLink limits (notes 2000, original text 10000, names 80): never let a long template reject a ride.
     .map((b) => ({ ...b, notes: b.notes.slice(0, 2000), original_text: b.original_text.slice(0, 10000), pickup_city_display: b.pickup_city_display.slice(0, 80), dest_city_display: b.dest_city_display.slice(0, 80) }));
-  if (DRY_RUN) { log("DRY RUN would send:", JSON.stringify(batch.map((b) => [b.source_ref, b.pickup_city, b.dest_city, b.price]))); return { ready: ready.length, dry: true }; }
-  if (!DL_URL || !DL_KEY) return { ready: ready.length, error: "DRIVELINK_INTAKE_URL / KEY missing in .env" };
+  stats.queue = readyQueue.length;
+  return { messages: messages.length, split: splitCount, removed: toDismiss.length, ready: ready.length };
+}
+
+export async function sendNext() {
+  const count = Math.min(PER_CYCLE, MAX_RIDES_PER_CALL);
+  const batch: Payload[] = [];
+  while (batch.length < count && readyQueue.length) {
+    const next = readyQueue.shift()!;
+    const t = transferCache.get(next.source_ref);
+    if (t && (t.status !== "error" || t.attempts >= MAX_ATTEMPTS)) continue; // sent meanwhile
+    batch.push(next);
+  }
+  stats.queue = readyQueue.length;
+  if (!batch.length) return {};
+  if (DRY_RUN) { log("DRY RUN would send:", JSON.stringify(batch.map((b) => [b.source_ref, b.pickup_city, b.dest_city, b.price]))); return { dry: true }; }
+  if (!DL_URL || !DL_KEY) return { error: "DRIVELINK_INTAKE_URL / KEY missing in .env" };
+  const transferMap = transferCache;
   const results = await pushRides(batch, DL_URL, DL_KEY);
+  stats.lastSendAt = Date.now();
   const rows = results.map((res) => ({
     message_id: res.source_ref,
     status: res.ok ? (res.duplicate ? "duplicate" : "sent") : "error",
@@ -405,33 +438,53 @@ export async function cycle() {
   if (fresh.length) await sb("wa_transfers?on_conflict=message_id", { method: "POST", headers: { Prefer: "resolution=merge-duplicates,return=minimal" }, body: JSON.stringify(fresh) });
   if (dupes.length) await sb("wa_transfers?on_conflict=message_id", { method: "POST", headers: { Prefer: "resolution=ignore-duplicates,return=minimal" }, body: JSON.stringify(dupes) });
   for (const r of rows) transferCache.set(r.message_id, { message_id: r.message_id, status: r.status, attempts: r.attempts });
-  return { ready: ready.length, sent: rows.filter((r) => r.status === "sent").length, duplicate: rows.filter((r) => r.status === "duplicate").length, errors: rows.filter((r) => r.status === "error").map((r) => r.error) };
+  return { sent: rows.filter((r) => r.status === "sent").length, duplicate: rows.filter((r) => r.status === "duplicate").length, errors: rows.filter((r) => r.status === "error").map((r) => r.error) };
 }
 
-if (process.env.WORKER_NO_LOOP !== "1") (async function loop() {
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+if (process.env.WORKER_NO_LOOP !== "1") (async function main() {
   if (!SB_KEY) { log("SUPABASE_KEY missing in .env"); process.exit(1); }
   if (!WORKER_TOKEN) log("WORKER_TOKEN missing in .env — settings/keywords/overrides cannot be read");
   log("worker started", { interval: INTERVAL, perCycle: PER_CYCLE, dryRun: DRY_RUN, drivelink: Boolean(DL_URL && DL_KEY) });
-  let last = "";
-  let lastBeat = 0;
   let lastError: string | null = null;
-  for (;;) {
-    try {
-      const result = JSON.stringify(await cycle());
-      if (result !== last || /"sent":[1-9]|"error"/.test(result)) log(result);
-      last = result;
-      lastError = null;
-    } catch (e) {
-      lastError = String(e instanceof Error ? e.message : e).slice(0, 300);
-      log("cycle error:", lastError);
+  let last = "";
+  // Process loop: runs back to back with a 2-second pause.
+  const processLoop = async () => {
+    for (;;) {
+      try {
+        const result = JSON.stringify(await processCycle());
+        if (result !== last) log(result, `cycle ${stats.cycleMs}ms`);
+        last = result;
+        lastError = null;
+      } catch (e) {
+        lastError = String(e instanceof Error ? e.message : e).slice(0, 300);
+        log("cycle error:", lastError);
+      }
+      await sleep(2_000);
     }
-    // Sign of life once a minute (row id "worker" in wa_status), including the last error if any.
-    if (Date.now() - lastBeat > 60_000) {
-      lastBeat = Date.now();
-      sb("wa_status?on_conflict=id", { method: "POST", headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
-        body: JSON.stringify([{ id: "worker", last_heartbeat: new Date().toISOString(), version: "worker", last_error: lastError }]) })
+  };
+  // Send loop: one ride every INTERVAL, independent of how long processing takes.
+  const sendLoop = async () => {
+    for (;;) {
+      const started = Date.now();
+      try {
+        const result = await sendNext();
+        if (Object.keys(result).length) log(JSON.stringify(result), `queue ${stats.queue}`);
+      } catch (e) {
+        lastError = String(e instanceof Error ? e.message : e).slice(0, 300);
+        log("send error:", lastError);
+      }
+      await sleep(Math.max(0, INTERVAL - (Date.now() - started)));
+    }
+  };
+  // Sign of life once a minute (row id "worker" in wa_status) with speed numbers.
+  const beatLoop = async () => {
+    for (;;) {
+      await sb("wa_status?on_conflict=id", { method: "POST", headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+        body: JSON.stringify([{ id: "worker", last_heartbeat: new Date().toISOString(), version: `worker · cycle ${(stats.cycleMs / 1000).toFixed(1)}s · queue ${stats.queue}`, pending: stats.queue, last_error: lastError }]) })
         .catch((e) => log("heartbeat failed:", String(e)));
+      await sleep(60_000);
     }
-    await new Promise((r) => setTimeout(r, INTERVAL));
-  }
+  };
+  await Promise.all([processLoop(), sendLoop(), beatLoop()]);
 })();
