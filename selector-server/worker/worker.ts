@@ -8,7 +8,8 @@ import { autoEligible, MAX_ATTEMPTS, MAX_RIDES_PER_CALL, pushRides, toDriveLinkR
 import { autoDismissRows, markDuplicatesExceptSplitParents } from "./lib/ride-rules";
 import { autoSplitRows } from "./lib/ride-split";
 import { lookupCandidates, photonPick, type PhotonFeature } from "./lib/place-lookup";
-import { splitPart } from "./lib/ride-parse";
+import { placeLabel, splitPart } from "./lib/ride-parse";
+import { rideAt } from "./lib/drivelink";
 
 const SB_URL = process.env.SUPABASE_URL || "https://xxbstgdhtlalremiftwf.supabase.co";
 const SB_KEY = process.env.SUPABASE_KEY || "";
@@ -228,6 +229,48 @@ async function loadTransfers() {
   return transferCache;
 }
 
+// ---------- Ride board (wa_ride_board): the website shows what the server decided ----------
+const boardHash = new Map<string, string>();
+let boardPrunedAt = 0;
+type BoardSource = Parameters<typeof toDriveLinkRide>[0] & { status: string; checkReason: string | null; dismissed: boolean; message: { id: string; timestamp: string | null; body: string | null; sender_name: string | null; sender_phone?: string | null; split_of?: string | null; is_duplicate: boolean; dup_of: string | null } };
+async function writeBoard(rows: BoardSource[], notesTemplate: string | null, aliases: PlaceAlias[]) {
+  const changed: Record<string, unknown>[] = [];
+  const seen = new Set<string>();
+  for (const r of rows) {
+    if (!r.message.timestamp) continue;
+    seen.add(r.message.id);
+    const payload = toDriveLinkRide(r, { notesTemplate, aliases });
+    const row = {
+      message_id: r.message.id, message_ts: r.message.timestamp, split_of: r.message.split_of ?? null,
+      group_name: r.groupName, sender_name: r.message.sender_name, sender_phone: r.message.sender_phone ?? null,
+      origin: r.origin, destination: r.destination,
+      origin_label: r.origin ? placeLabel(r.origin, aliases) : null, destination_label: r.destination ? placeLabel(r.destination, aliases) : null,
+      price: r.ride.price, ride_time: r.ride.time, ride_at: rideAt(r.ride.time, r.message.timestamp),
+      phone: r.phone ? r.phone.replace(/\D/g, "") : null, wa_link: r.ride.waLink, tg_link: r.ride.tgLink,
+      passengers: r.ride.passengers ?? null, luggage: r.ride.luggage ?? null, female_driver: Boolean(r.ride.femaleDriver),
+      notes: payload.notes, body: r.message.body, status: r.status, check_reason: r.checkReason,
+      is_duplicate: r.message.is_duplicate, dup_of: r.message.dup_of, dismissed: r.dismissed || Boolean(overrideCache.get(r.message.id)?.dismissed_at),
+      payload: { ...payload, notes: payload.notes.slice(0, 2000), original_text: payload.original_text.slice(0, 10000), pickup_city_display: payload.pickup_city_display.slice(0, 80), dest_city_display: payload.dest_city_display.slice(0, 80) },
+    };
+    const hash = JSON.stringify(row);
+    if (boardHash.get(row.message_id) === hash) continue;
+    boardHash.set(row.message_id, hash);
+    changed.push(row);
+  }
+  for (const id of boardHash.keys()) if (!seen.has(id)) boardHash.delete(id);
+  const prune = Date.now() - boardPrunedAt > 10 * 60_000;
+  if (!changed.length && !prune) return;
+  for (let i = 0; i < Math.max(changed.length, 1); i += 300) {
+    try {
+      await rpc("worker_board_upsert", { p_rows: changed.slice(i, i + 300), p_prune_before: prune && i === 0 ? new Date(Date.now() - 26 * 60 * 60_000).toISOString() : null });
+    } catch (e) {
+      for (const r of changed.slice(i, i + 300)) boardHash.delete(String(r["message_id"])); // retry next cycle
+      throw e;
+    }
+  }
+  if (prune) boardPrunedAt = Date.now();
+}
+
 // ---------- Two loops: "process" (read, parse, split, remove, queue) and "send" (one ride every INTERVAL) ----------
 // Sending never waits for the heavy processing, so the gap between rides stays exactly INTERVAL.
 type Payload = ReturnType<typeof toDriveLinkRide>;
@@ -378,7 +421,7 @@ async function processInner() {
     });
     const streetsHere = streetPhrases(row.ride).filter((p) => { const c = streets.get(cityKey(p)); return Boolean(c?.length && ((origin && c.includes(origin)) || (destination && c.includes(destination)))); });
     const siblings = row.message.split_of ? messages.filter((m) => m.split_of === row.message.split_of).length : 0;
-    finished.push({ message: row.message, ride: row.ride, groupName: row.groupName, origin, destination, pickupAddress, phone: a.phone, linkContact: a.linkContact, status: a.status,
+    finished.push({ message: row.message, ride: row.ride, groupName: row.groupName, origin, destination, pickupAddress, phone: a.phone, linkContact: a.linkContact, status: a.status, checkReason: a.checkReason,
       streets: streetsHere, splitPart: splitPart(row.message.id, row.message.split_of, siblings),
       approved: Boolean(row.override?.approved_at), multiRides: new Array(row.multiRideCount).fill(0),
       dismissed: Boolean(row.override?.dismissed_at), splitParent: row.multiRideCount >= 2 || row.override?.dismiss_kind === "split" });
@@ -395,6 +438,9 @@ async function processInner() {
     for (const d of toDismiss) overrideCache.set(d.message_id, { ...(overrideCache.get(d.message_id) ?? emptyOverride(d.message_id)), dismissed_at: d.dismissed_at, dismiss_kind: "auto" });
     log("auto removed:", toDismiss.length, "rides");
   }
+  // ---- Ride board for the website: only rows that changed are written (the Transfer page reads this table).
+  await writeBoard(marked.filter((r) => !r.splitParent), settings?.notes_template ?? null, aliasRows);
+
   if (!sending) { readyQueue = []; stats.queue = 0; return { messages: messages.length, split: splitCount, removed: toDismiss.length, skipped: "auto transfer is off" }; }
 
   const ready = [];
