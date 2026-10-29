@@ -3,7 +3,7 @@
   if (window.__waHubMonitor) return;
   window.__waHubMonitor = true;
 
-  const VERSION = "1.2.0";
+  const VERSION = "1.3.0";
   const SKIP_TYPES = new Set([
     "gp2", "notification", "notification_template", "e2e_notification", "protocol",
     "ciphertext", "call_log", "revoked", "debug", "broadcast_notification", "pinned_message",
@@ -139,8 +139,19 @@
       }));
   }
 
+  // Only send groups that are new or changed (name / participant count). Re-sending all of them every
+  // 10 minutes rewrote ~200 rows each time and made every open app screen reload.
+  const sentGroups = new Map();
   function syncGroups() {
-    try { const g = groups(); post("groups", g); return g.length; } catch (e) { log("groups error", e); return 0; }
+    try {
+      const g = groups();
+      const changed = g.filter((x) => sentGroups.get(x.id) !== x.name + "|" + x.participants);
+      if (changed.length) {
+        post("groups", changed);
+        for (const x of changed) sentGroups.set(x.id, x.name + "|" + x.participants);
+      }
+      return g.length;
+    } catch (e) { log("groups error", e); return 0; }
   }
 
   // Safety net: anything that is in memory and newer than `sinceSec` gets (re)sent; the database ignores duplicates.

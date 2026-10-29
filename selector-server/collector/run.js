@@ -29,7 +29,7 @@ function buildExtension() {
     if (!fs.statSync(path.join(EXT_SRC, f)).isFile()) continue;
     let text = fs.readFileSync(path.join(EXT_SRC, f), "utf8");
     if (f === "bg.js") text = text.replace("__SUPABASE_KEY__", KEY);
-    if (f === "main.js") text = text.replace('const VERSION = "1.2.0";', 'const VERSION = "1.2.0-server";');
+    if (f === "main.js") text = text.replace(/const VERSION = "([^"]+)";/, 'const VERSION = "$1-server";');
     fs.writeFileSync(path.join(EXT, f), text);
   }
 }
