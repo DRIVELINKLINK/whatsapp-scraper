@@ -24,6 +24,8 @@ export type Ride = {
   /** A פ/פנימי-marked internal ride that also mentions two or more other known places. */
   internalConflict: boolean;
   singlePlaceUnsure: boolean;
+  /** One known place only; internal was inferred without a פ marker (verify with resolveSinglePlace). */
+  singlePlaceInferred: boolean;
   priceUnsure: boolean;
   verifiedLink: boolean;
 };
@@ -84,9 +86,25 @@ export function normalizePhone(phone: string): string | null {
   if (/^0[1-9]\d{7}$/.test(digits)) return `${digits.slice(0, 2)}-${digits.slice(2)}`;
   return null;
 }
-const hasPhrase = (line: string, keywords: PhoneKeyword[], kind?: PhoneKeyword["kind"]) => keywords.some((keyword) =>
-  (!kind || keyword.kind === kind) && keyword.phrase.trim() && line.includes(clean(keyword.phrase).trim()),
-);
+/** Built-in distribution markers: always "ignore", whatever the admin list contains. */
+export const BUILTIN_IGNORE_PHRASES = ["מספרי הפצה", "מספר הפצה", "לצרף", "צרפו"];
+/** Symbols, asterisks, emoji and repeated spaces never affect keyword matching. */
+export const keywordNorm = (value: string) => clean(value).replace(/[^\p{L}\p{N}\s'"׳״]/gu, " ").replace(/\s+/g, " ").trim();
+const phraseHit = (line: string, phrase: string) => { const p = keywordNorm(phrase); return Boolean(p) && ` ${keywordNorm(line)} `.includes(p); };
+export function hasPhrase(line: string, keywords: PhoneKeyword[], kind?: PhoneKeyword["kind"]): boolean {
+  if ((!kind || kind === "ignore") && BUILTIN_IGNORE_PHRASES.some(phrase => phraseHit(line, phrase))) return true;
+  return keywords.some((keyword) => (!kind || keyword.kind === kind) && phraseHit(line, keyword.phrase));
+}
+/** Phone from a wa.me / api.whatsapp.com link (972… → 05…), else null. */
+export function linkPhone(link: string | null | undefined): string | null {
+  if (!link || !/(?:wa\.me\/|api\.whatsapp\.com\/send)/i.test(link)) return null;
+  const digits = link.match(/wa\.me\/\+?(\d{9,13})/i)?.[1] ?? link.match(/[?&]phone=\+?(\d{9,13})/i)?.[1];
+  return digits ? normalizePhone(digits) : null;
+}
+/** Removes phone numbers from a raw line, leaving link lines untouched. */
+export function removePhones(text: string): string {
+  return text.split(/\r?\n/).map(line => LINK.test(line) ? (LINK.lastIndex = 0, line) : line.replace(phonePattern(), " ").replace(/[ \t]+$/,"")).join("\n");
+}
 
 export function stripPhoneNumbers(text: string): string {
   return clean(text).replace(phonePattern(), " ");
@@ -226,9 +244,10 @@ export function parseRide(text: string, options: PlaceOptions | PhoneKeyword[] =
   // Explicit currency prices win over bare numbers, regardless of line order.
   const priceLines = withoutTimes.map(line => rideExtras(line).masked);
   let selectedBare: { line: number; index: number; raw: string } | null = null;
-  const sources = priceLines.map(line => line.replace(currencyPattern, (match, amount: string) => {
+  let priceLine: number | null = null;
+  const sources = priceLines.map((line, li) => line.replace(currencyPattern, (match, amount: string) => {
     const value = Math.floor(Number(amount) / 10 + 0.5) * 10;
-    if (isValidRidePrice(value)) { if (price === null) { price = value; explicitPrice = true; return " "; } return match; }
+    if (isValidRidePrice(value)) { if (price === null) { price = value; explicitPrice = true; priceLine = li; return " "; } return match; }
     invalidCandidate = true;
     return match;
   }));
@@ -238,7 +257,7 @@ export function parseRide(text: string, options: PlaceOptions | PhoneKeyword[] =
       if (!words.some((_word, index) => matchCity(words, index, lookup))) continue;
       for (const match of line.matchAll(barePattern)) {
         const amount = Math.floor(Number(match[1]) / 10 + 0.5) * 10;
-        if (isValidRidePrice(amount)) { price = amount; selectedBare = {line:lineIndex,index:match.index,raw:match[0]}; break; }
+        if (isValidRidePrice(amount)) { price = amount; priceLine = lineIndex; selectedBare = {line:lineIndex,index:match.index,raw:match[0]}; break; }
       }
       if (price !== null) break;
     }
@@ -257,6 +276,7 @@ export function parseRide(text: string, options: PlaceOptions | PhoneKeyword[] =
     return match;
   }).replace(/[,;:!?…()\[\]{}→/\\|_~&+]/g, " ").trim().split(/\s+/).filter(Boolean));
   let origin: string | null = null, destination: string | null = null;
+  let originLine: number | null = null, destinationLine: number | null = null;
   let originToken: string | null = null, destinationToken: string | null = null;
   const matchedCities: string[] = [], notesLines: string[] = [];
   const MARKERS = new Set(["פ", "פ'", "פ׳", "פנימי"]);
@@ -291,8 +311,8 @@ export function parseRide(text: string, options: PlaceOptions | PhoneKeyword[] =
           hasNotes = true;
         } else {
           matchedCities.push(city.city);
-          if (origin === null) { origin = city.city; originToken = city.token; }
-          else if (destination === null) { destination = city.city; destinationToken = city.token; }
+          if (origin === null) { origin = city.city; originToken = city.token; originLine = lineIndex; }
+          else if (destination === null) { destination = city.city; destinationToken = city.token; destinationLine = lineIndex; }
           if (city.keepInNotes) { hasNotes = true; residualWords = true; }
         }
         i += city.length;
@@ -304,19 +324,24 @@ export function parseRide(text: string, options: PlaceOptions | PhoneKeyword[] =
     if (hasNotes) notesLines.push(cleanedLines[lineIndex] ?? "");
   });
   let singlePlaceUnsure = false;
+  let singlePlaceInferred = false;
   if (internalHit) {
     origin = destination = internalHit.city;
     originToken = destinationToken = internalHit.token;
   } else if (new Set(matchedCities).size === 1) {
-    if (!residualWords && price !== null) destination = origin;
+    // One known place in the whole message: internal, extra words allowed (streets checked by resolveSinglePlace).
+    if (price !== null) { destination = origin; singlePlaceInferred = residualWords; }
     else { destination = null; singlePlaceUnsure = true; }
+  } else if (originLine !== null && destinationLine !== null && originLine !== destinationLine && priceLine === originLine) {
+    // Ride line has one place; the other place sits on another line — do not guess.
+    destination = null; destinationToken = null; singlePlaceUnsure = true;
   }
   return {
     isRide: origin !== null || price !== null || time !== null || priceUnsure,
     origin, destination, price, passengers, luggage, femaleDriver, time, notes: notesLines.join(" · "), notesLines,
     dispatcherPhone, originToken, destinationToken, ...links,
     internalConflict: !internalHit?.full && others.size >= 2,
-    singlePlaceUnsure, priceUnsure, verifiedLink,
+    singlePlaceUnsure, singlePlaceInferred, priceUnsure, verifiedLink,
   };
 }
 
@@ -427,22 +452,41 @@ export function renderDisplayMessage(
     .join("\n");
 }
 
-/** Splits only for preview; callers explicitly persist children after review. */
-export function splitRideBlocks(text: string, options: PlaceOptions = {}): { blocks: { text: string; ride: Ride }[]; shared: string[] } {
-  const chunks: string[] = [];
+export type RideBlockPart = { text: string; start: number; end: number };
+/**
+ * Splits a message into ride blocks (origin or price) and shared parts. A part with an
+ * "ignore" keyword and everything after it is distribution text: shared, never a ride.
+ * start/end are indices among nonblank lines.
+ */
+export function splitRideBlocks(text: string, options: PlaceOptions = {}): { blocks: (RideBlockPart & { ride: Ride })[]; shared: string[]; sharedParts: (RideBlockPart & { ignored: boolean })[] } {
+  const keywords = options.keywords ?? DEFAULT_PHONE_KEYWORDS;
+  const chunks: RideBlockPart[] = [];
   let current: string[] = [];
-  const flush = () => { if (current.length) chunks.push(current.join("\n")); current = []; };
+  let index = 0;
+  const flush = () => { if (current.length) chunks.push({ text: current.join("\n"), start: index - current.length, end: index - 1 }); current = []; };
   for (const line of text.split(/\r?\n/)) {
     if (!line.trim()) { flush(); continue; }
     if (/^(?:[01]?\d|2[0-3]):[0-5]\d$/.test(line.trim()) && current.length && parseRide(current.join("\n"), options).price !== null) flush();
-    current.push(line);
+    current.push(line); index++;
   }
   flush();
-  const blocks: { text: string; ride: Ride }[] = [], shared: string[] = [];
+  const blocks: (RideBlockPart & { ride: Ride })[] = [], sharedParts: (RideBlockPart & { ignored: boolean })[] = [];
+  let ignored = false;
   for (const chunk of chunks) {
-    const ride = parseRide(chunk, options);
-    if (ride.price !== null || ride.origin !== null) blocks.push({text:chunk,ride});
-    else shared.push(chunk);
+    ignored ||= chunk.text.split("\n").some(line => hasPhrase(line, keywords, "ignore"));
+    const ride = ignored ? null : parseRide(chunk.text, options);
+    if (ride && (ride.price !== null || ride.origin !== null)) blocks.push({ ...chunk, ride });
+    else sharedParts.push({ ...chunk, ignored });
   }
-  return {blocks,shared};
+  return { blocks, shared: sharedParts.map(part => part.text), sharedParts };
+}
+
+/**
+ * Verifies an inferred single-place internal ride against the street index:
+ * a leftover phrase that is a street only in other cities (not the origin) means "check".
+ */
+export function resolveSinglePlace(ride: Ride, origin: string | null, resolve: (phrase: string) => string[] | undefined): { destination: string | null; unsure: boolean } {
+  if (!origin || !ride.singlePlaceInferred) return { destination: ride.destination, unsure: ride.singlePlaceUnsure };
+  const elsewhere = streetPhrases(ride).some(phrase => { const cities = resolve(phrase); return Boolean(cities?.length) && !cities!.includes(origin); });
+  return elsewhere ? { destination: null, unsure: true } : { destination: origin, unsure: false };
 }

@@ -1,5 +1,5 @@
 // Copied from the WhatsApp Selector app (src/lib/ride-status.ts). Keep in sync.
-import { extractDispatcherPhone, normalizePhone, rideTextPhones, type PhoneKeyword } from "./ride-parse";
+import { extractDispatcherPhone, linkPhone, normalizePhone, rideTextPhones, type PhoneKeyword } from "./ride-parse";
 
 export type RideStatus = "ready" | "check" | "places" | "nophone";
 export type PhoneChoice = "dispatcher" | "sender";
@@ -13,6 +13,8 @@ export function assessRide(input: {
   multiRideCount?: number;
   inheritedPhoneAmbiguous?: boolean;
    verifiedLink?: boolean;
+  /** wa.me / api.whatsapp.com link: its phone becomes the contact phone. */
+  waLink?: string | null;
    singlePlaceUnsure?: boolean;
    priceUnsure?: boolean;
    notesLineCount?: number;
@@ -28,11 +30,12 @@ export function assessRide(input: {
   const manual = input.overridePhone?.trim() ? normalizePhone(input.overridePhone) ?? input.overridePhone.trim() : null;
   const linkContact = Boolean(input.hasLink && (input.verifiedLink || input.adminApproved));
   const approved = input.phoneChoice === "sender" || input.phoneChoice === "dispatcher" || Boolean(manual) || linkContact;
-  const phone = linkContact ? null : manual ?? (input.phoneChoice === "sender" ? sender
+  // IRON RULE: ready needs a phone. A verified WhatsApp link supplies one; a t.me link alone does not.
+  const phone = manual ?? (linkContact ? linkPhone(input.waLink) ?? confirmed : input.phoneChoice === "sender" ? sender
     : input.phoneChoice === "dispatcher" ? candidatePhone : confirmed ?? sender);
   const unconfirmedPhone = Boolean(candidatePhone && !confirmed && !approved && !input.adminApproved);
   const checkReason = (input.multiRideCount ?? 0) >= 2 ? `${input.multiRideCount} נסיעות בהודעה אחת — לפרק` : input.adminApproved ? null
-    : input.inheritedPhoneAmbiguous ? "מספר טלפון לא מאושר"
+    : input.inheritedPhoneAmbiguous && !confirmed ? "מספר טלפון לא מאושר"
     : input.hasLink && !linkContact ? "קישור לא מאומת כסדרן"
     : input.internalConflict ? "פנימי עם ערים נוספות"
     : input.singlePlaceUnsure ? "מקום אחד ומילים נוספות — לא ודאי שפנימי"
@@ -41,7 +44,7 @@ export function assessRide(input: {
     : unconfirmedPhone ? "מספר טלפון לא מאושר" : null;
   const status: RideStatus = checkReason ? "check"
     : !input.origin || !input.destination ? "places"
-    : !phone && !linkContact ? "nophone" : "ready";
+    : !phone ? "nophone" : "ready";
   return { status, phone, unconfirmedPhone, candidatePhone, checkReason, linkContact };
 }
 
