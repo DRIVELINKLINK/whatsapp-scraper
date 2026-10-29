@@ -12,6 +12,9 @@ const DL_URL = process.env.DRIVELINK_INTAKE_URL || "";
 const DL_KEY = process.env.DRIVELINK_INTAKE_KEY || "";
 const INTERVAL = Number(process.env.WORKER_INTERVAL_MS || 20_000);
 const DRY_RUN = process.env.DRY_RUN === "1";
+// Private key for the worker-only database functions (settings, keywords, filters and overrides are
+// locked to signed-in users in the app, so the worker reads them through worker_config / worker_overrides).
+const WORKER_TOKEN = process.env.WORKER_TOKEN || "";
 const DAY = 24 * 60 * 60 * 1000;
 
 const log = (...a: unknown[]) => console.log(new Date().toISOString(), ...a);
@@ -27,6 +30,14 @@ async function sb<T>(path: string, init: RequestInit = {}): Promise<T> {
   const text = await res.text();
   return (text ? JSON.parse(text) : null) as T;
 }
+async function rpc<T>(fn: string, args: Record<string, unknown>): Promise<T> {
+  return sb<T>(`rpc/${fn}`, { method: "POST", body: JSON.stringify({ p_token: WORKER_TOKEN, ...args }) });
+}
+type WorkerConfig = {
+  settings: { auto_transfer: boolean; auto_transfer_since: string | null } | null;
+  keywords: PhoneKeyword[];
+  note_filters: NoteFilter[];
+};
 async function sbAll<T>(path: string): Promise<T[]> {
   const out: T[] = [];
   for (let offset = 0; ; offset += 1000) {
@@ -140,12 +151,13 @@ async function loadMessages(ids: string[], from: string): Promise<Msg[]> {
 let configCache: { at: number; aliasRows: PlaceAlias[]; customPlaces: { name: string }[]; keywords: PhoneKeyword[]; noteFilters: NoteFilter[] } | null = null;
 async function loadConfig() {
   if (configCache && Date.now() - configCache.at < CONFIG_MS) return configCache;
-  const [aliasRows, customPlaces, keywordRows, filterRows] = await Promise.all([
+  const [aliasRows, customPlaces, worker] = await Promise.all([
     sbAll<PlaceAlias>("wa_place_aliases?select=alias,official_name,is_display,keep_in_notes,use_for_parse,is_hero&order=alias"),
     sbAll<{ name: string }>("wa_custom_places?select=name&order=name"),
-    sbAll<PhoneKeyword>("wa_phone_keywords?select=phrase,kind&order=phrase"),
-    sbAll<NoteFilter>("wa_note_filters?select=phrase,kind&order=phrase"),
+    rpc<WorkerConfig>("worker_config", {}),
   ]);
+  const keywordRows = worker.keywords ?? [];
+  const filterRows = worker.note_filters ?? [];
   configCache = {
     at: Date.now(), aliasRows, customPlaces,
     keywords: keywordRows.filter((k) => k.kind === "dispatcher" || k.kind === "ignore"),
@@ -159,11 +171,11 @@ let overrideState = { at: 0, last: "" };
 async function loadOverrides() {
   if (!overrideState.last || Date.now() - overrideState.at > FULL_SMALL_MS) {
     overrideCache.clear();
-    for (const o of await sbAll<Override & { updated_at: string }>("wa_ride_overrides?select=*")) overrideCache.set(o.message_id, o);
+    for (const o of await rpc<(Override & { updated_at: string })[]>("worker_overrides", { p_since: null })) overrideCache.set(o.message_id, o);
     overrideState.at = Date.now();
   } else {
     const after = new Date(Date.parse(overrideState.last) - 120_000).toISOString();
-    for (const o of await sbAll<Override & { updated_at: string }>(`wa_ride_overrides?select=*&updated_at=gt.${encodeURIComponent(after)}`)) overrideCache.set(o.message_id, o);
+    for (const o of await rpc<(Override & { updated_at: string })[]>("worker_overrides", { p_since: after })) overrideCache.set(o.message_id, o);
   }
   let last = overrideState.last;
   for (const o of overrideCache.values()) if (o.updated_at && o.updated_at > last) last = o.updated_at;
@@ -183,7 +195,7 @@ async function loadTransfers() {
 }
 
 export async function cycle() {
-  const settings = (await sb<{ auto_transfer: boolean; auto_transfer_since: string | null }[]>("wa_display_settings?id=eq.main&select=auto_transfer,auto_transfer_since"))[0];
+  const settings = (await rpc<WorkerConfig>("worker_config", {})).settings;
   if (!settings?.auto_transfer || !settings.auto_transfer_since) return { skipped: "auto transfer is off" };
   const since = settings.auto_transfer_since;
   const from = new Date(Math.max(Date.parse(since), Date.now() - DAY)).toISOString();
@@ -276,22 +288,38 @@ export async function cycle() {
     attempts: (transferMap.get(res.source_ref)?.attempts ?? 0) + 1,
     sent_at: new Date().toISOString(),
   }));
-  await sb("wa_transfers?on_conflict=message_id", { method: "POST", headers: { Prefer: "resolution=merge-duplicates,return=minimal" }, body: JSON.stringify(rows) });
+  // "duplicate" means DriveLink already has the ride (e.g. the browser sent it first): never overwrite that record.
+  const fresh = rows.filter((r) => r.status !== "duplicate");
+  const dupes = rows.filter((r) => r.status === "duplicate");
+  if (fresh.length) await sb("wa_transfers?on_conflict=message_id", { method: "POST", headers: { Prefer: "resolution=merge-duplicates,return=minimal" }, body: JSON.stringify(fresh) });
+  if (dupes.length) await sb("wa_transfers?on_conflict=message_id", { method: "POST", headers: { Prefer: "resolution=ignore-duplicates,return=minimal" }, body: JSON.stringify(dupes) });
   for (const r of rows) transferCache.set(r.message_id, { message_id: r.message_id, status: r.status, attempts: r.attempts });
   return { ready: ready.length, sent: rows.filter((r) => r.status === "sent").length, duplicate: rows.filter((r) => r.status === "duplicate").length, errors: rows.filter((r) => r.status === "error").map((r) => r.error) };
 }
 
 if (process.env.WORKER_NO_LOOP !== "1") (async function loop() {
   if (!SB_KEY) { log("SUPABASE_KEY missing in .env"); process.exit(1); }
+  if (!WORKER_TOKEN) log("WORKER_TOKEN missing in .env — settings/keywords/overrides cannot be read");
   log("worker started", { interval: INTERVAL, dryRun: DRY_RUN, drivelink: Boolean(DL_URL && DL_KEY) });
   let last = "";
+  let lastBeat = 0;
+  let lastError: string | null = null;
   for (;;) {
     try {
       const result = JSON.stringify(await cycle());
       if (result !== last || !result.includes('"ready":0')) log(result);
       last = result;
+      lastError = null;
     } catch (e) {
-      log("cycle error:", String(e instanceof Error ? e.message : e));
+      lastError = String(e instanceof Error ? e.message : e).slice(0, 300);
+      log("cycle error:", lastError);
+    }
+    // Sign of life once a minute (row id "worker" in wa_status), including the last error if any.
+    if (Date.now() - lastBeat > 60_000) {
+      lastBeat = Date.now();
+      sb("wa_status?on_conflict=id", { method: "POST", headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+        body: JSON.stringify([{ id: "worker", last_heartbeat: new Date().toISOString(), version: "worker", last_error: lastError }]) })
+        .catch((e) => log("heartbeat failed:", String(e)));
     }
     await new Promise((r) => setTimeout(r, INTERVAL));
   }
