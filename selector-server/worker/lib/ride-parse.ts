@@ -490,3 +490,90 @@ export function resolveSinglePlace(ride: Ride, origin: string | null, resolve: (
   const elsewhere = streetPhrases(ride).some(phrase => { const cities = resolve(phrase); return Boolean(cities?.length) && !cities!.includes(origin); });
   return elsewhere ? { destination: null, unsure: true } : { destination: origin, unsure: false };
 }
+
+/** Display label for a place: Hero alias ?? display alias ?? official. */
+export function placeLabel(official: string | null, aliases: PlaceAlias[]): string {
+  if (!official) return "";
+  return heroName(official, aliases) ?? displayName(official, aliases);
+}
+
+/** Hebrew error when `alias` as Hero for `official` collides with another place's Hero name; else null. */
+export function heroConflict(alias: string, official: string, aliases: PlaceAlias[]): string | null {
+  const key = cityKey(alias);
+  const other = aliases.find((row) => row.is_hero && row.official_name !== official && cityKey(row.alias) === key);
+  return other ? `השם "${alias}" כבר מוגדר כענק של "${other.official_name}" — שני מקומות שונים לא יכולים לקבל אותו שם ענק` : null;
+}
+
+export const DEFAULT_NOTES_TEMPLATE = "{שעה} {מוצא} {יעד} {מחיר}\n{שאר ההודעה}";
+export const NOTES_PLACEHOLDERS = ["שעה","מוצא","יעד","מוצא רשמי","יעד רשמי","מחיר","סוג","מקומות","מזוודות","נהגת","כתובת איסוף","רחובות","שאר ההודעה","שולח","טלפון","טלפון שולח","קבוצה","וואטסאפ","טלגרם","תאריך","שעת הודעה","מספר בפירוק","טקסט מקורי"] as const;
+
+const escapeRe = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+/** Note lines without the recognized places, price, time, phones, links and passenger/luggage/נהגת words. */
+export function restOfMessage(ride: Pick<Ride, "notesLines" | "originToken" | "destinationToken" | "price">): string {
+  const tokens = [ride.originToken, ride.destinationToken].filter((t): t is string => Boolean(t)).sort((a, b) => b.length - a.length);
+  const extraPatterns = [
+    /(?<![\d\p{L}])(?:\d+\s*(?:מקומות|מקום|נוסעים|נוסע|מק['׳’])|(?:נוסע|מקום)\s+אחד|נוסעת\s+אחת)(?![\p{L}\d])/gu,
+    /(?<![\d\p{L}])(?:\d+\s*מזוודות|מזוודה(?:\s+גדולה)?|\d+\s*[גק])(?![\p{L}\d])/gu,
+    /(?<![\p{L}])נהגת(?![\p{L}])/gu,
+  ];
+  return ride.notesLines.map((raw) => {
+    let line = clean(raw).replace(phonePattern(), " ");
+    line = line.replace(/(?<![\d\p{L}])\d{1,2}[:.]\d{2}(?![\d\p{L}])/gu, " ");
+    for (const pattern of extraPatterns) line = line.replace(pattern, " ");
+    if (ride.price !== null) line = line.replace(new RegExp(`(?<![\\d\\p{L}])${ride.price}(?:\\s*(?:ש["״']?ח|ש|₪))?(?![\\d\\p{L}])`, "gu"), " ");
+    line = line.replace(/₪/g, " ");
+    for (const token of tokens) line = line.replace(new RegExp(`(?<![\\p{L}])[ולמבה]?${escapeRe(token)}(?![\\p{L}])`, "gu"), " ");
+    line = line.replace(/(?<![\p{L}])(?:פנימי|פ['׳]?)(?![\p{L}])/gu, " ");
+    return line.replace(/[,;:!?…()\[\]{}→/\\|_~&+\-–]+/g, " ").replace(/\s+/g, " ").trim();
+  }).filter((line) => /[\p{L}\p{N}]/u.test(line)).join("\n");
+}
+
+export type RideNotesInfo = {
+  sender?: string | null; group?: string | null; senderPhone?: string | null; phone?: string | null; linkContact?: boolean;
+  pickupAddress?: string | null; streets?: string[]; messageTime?: string | null; splitPart?: string | null; originalText?: string | null;
+};
+/** Render the notes template; empty placeholders disappear, empty lines removed, double spaces collapsed. */
+export function renderRideNotes(template: string, ride: Ride, info: RideNotesInfo, aliases: PlaceAlias[]): string {
+  const digits = (phone: string | null | undefined) => phone ? (normalizePhone(phone) ?? phone).replace(/\D/g, "") : "";
+  const internal = Boolean(ride.origin && ride.origin === ride.destination);
+  const linkContact = info.linkContact ?? ride.verifiedLink;
+  const phone = linkContact ? "" : digits(info.phone !== undefined ? info.phone : ride.dispatcherPhone ?? info.senderPhone);
+  const at = info.messageTime && Number.isFinite(Date.parse(info.messageTime)) ? new Date(info.messageTime) : null;
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const streets = [...new Set([...(info.pickupAddress ? [info.pickupAddress] : []), ...(info.streets ?? [])])];
+  const values: Record<string, string> = {
+    "שעה": ride.time ?? "",
+    "מוצא": placeLabel(ride.origin, aliases),
+    "יעד": internal ? "" : placeLabel(ride.destination, aliases),
+    "מוצא רשמי": ride.origin ?? "",
+    "יעד רשמי": ride.destination ?? "",
+    "מחיר": ride.price === null ? "" : String(ride.price),
+    "סוג": ride.origin && ride.destination ? (internal ? "פנימי" : "בין עירוני") : "",
+    "מקומות": ride.passengers != null ? `${ride.passengers} מקומות` : "",
+    "מזוודות": ride.luggage != null ? `${ride.luggage} מזוודות` : "",
+    "נהגת": ride.femaleDriver ? "נהגת" : "",
+    "כתובת איסוף": info.pickupAddress ?? "",
+    "רחובות": streets.join(", "),
+    "שאר ההודעה": restOfMessage(ride),
+    "שולח": info.sender ?? "",
+    "טלפון": phone,
+    "טלפון שולח": linkContact ? "" : digits(info.senderPhone),
+    "קבוצה": info.group ?? "",
+    "וואטסאפ": ride.waLink ?? "",
+    "טלגרם": ride.tgLink ?? "",
+    "תאריך": at ? `${pad(at.getDate())}/${pad(at.getMonth() + 1)}/${at.getFullYear()}` : "",
+    "שעת הודעה": at ? `${pad(at.getHours())}:${pad(at.getMinutes())}` : "",
+    "מספר בפירוק": info.splitPart ?? "",
+    "טקסט מקורי": info.originalText ?? "",
+  };
+  const keys = [...NOTES_PLACEHOLDERS].sort((a, b) => b.length - a.length).map(escapeRe).join("|");
+  return template.replace(new RegExp(`\\{(${keys})\\}`, "g"), (_m, key: string) => values[key] ?? "")
+    .split("\n").map((line) => line.replace(/[ \t]{2,}/g, " ").trim()).filter(Boolean).join("\n");
+}
+
+/** "2/3" for split children (deterministic parent#N ids). */
+export function splitPart(id: string, splitOf: string | null | undefined, total: number): string | null {
+  if (!splitOf) return null;
+  const n = Number(id.slice(id.lastIndexOf("#") + 1));
+  return Number.isFinite(n) && n > 0 ? `${n}/${Math.max(total, n)}` : null;
+}

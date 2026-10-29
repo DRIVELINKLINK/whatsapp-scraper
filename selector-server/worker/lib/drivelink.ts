@@ -1,7 +1,8 @@
 // Copied from the WhatsApp Selector app (src/lib/drivelink.ts). Keep in sync.
+import { placeLabel, renderRideNotes, type PlaceAlias, type Ride, type RideNotesInfo } from "./ride-parse";
 /** Pure DriveLink mapping + push logic (no secrets here; the server fn supplies them). */
 export type DriveLinkRide = {
-  source_ref: string; pickup_city: string; dest_city: string; pickup_address: string; ride_at: string;
+  source_ref: string; pickup_city: string; dest_city: string; pickup_city_display: string; dest_city_display: string; pickup_address: string; ride_at: string;
   price: number | null; notes: string; dispatcher_name: string; phone: string; wa_link: string | null; tg_link: string | null;
   group_name: string; original_text: string;
   passengers: number | null; luggage: number | null; female_driver: boolean;
@@ -22,26 +23,41 @@ export function rideAt(time: string | null, messageIso: string | null): string {
 }
 
 export type MappableRide = {
-  message: { id: string; body: string | null; timestamp: string | null; sender_name: string | null };
+  message: { id: string; body: string | null; timestamp: string | null; sender_name: string | null; sender_phone?: string | null; split_of?: string | null };
   ride: { price: number | null; time: string | null; notesLines: string[]; waLink: string | null; tgLink: string | null; passengers?: number | null; luggage?: number | null; femaleDriver?: boolean };
   groupName: string; origin: string | null; destination: string | null; phone: string | null; pickupAddress?: string;
+  linkContact?: boolean; streets?: string[]; splitPart?: string | null;
 };
+export type DriveLinkOptions = { notesTemplate?: string | null; aliases?: PlaceAlias[] };
 const stripNoise = (line: string) => line
   .replace(/(?:https?:\/\/)?(?:wa\.me|api\.whatsapp\.com|t\.me|chat\.whatsapp\.com)\/\S*/gi, "")
   .replace(/https?:\/\/\S+/gi, "")
   .replace(/\+?\d[\d\s-]{7,}\d/g, "")
   .replace(/\s+/g, " ").trim();
 
-export function toDriveLinkRide(row: MappableRide): DriveLinkRide {
+/** Notes from the notes template (when given), else the cleaned note lines. */
+export function driveLinkNotes(row: MappableRide, options: DriveLinkOptions = {}): string {
+  if (!options.notesTemplate) return row.ride.notesLines.map(stripNoise).filter(Boolean).join("\n");
+  const ride = { originToken: null, destinationToken: null, dispatcherPhone: null, verifiedLink: false, passengers: null, luggage: null, femaleDriver: false, ...row.ride, origin: row.origin, destination: row.destination ?? row.origin } as unknown as Ride;
+  const info: RideNotesInfo = { sender: row.message.sender_name, senderPhone: row.message.sender_phone ?? null, phone: row.phone, group: row.groupName, pickupAddress: row.pickupAddress ?? null, streets: row.streets ?? [], messageTime: row.message.timestamp, splitPart: row.splitPart ?? null, originalText: row.message.body };
+  if (row.linkContact !== undefined) info.linkContact = row.linkContact;
+  return renderRideNotes(options.notesTemplate, ride, info, options.aliases ?? []);
+}
+
+export function toDriveLinkRide(row: MappableRide, options: DriveLinkOptions = {}): DriveLinkRide {
   const origin = row.origin ?? "";
+  const dest = row.destination ?? origin;
+  const aliases = options.aliases ?? [];
   return {
     source_ref: row.message.id,
     pickup_city: origin,
-    dest_city: row.destination ?? origin,
+    dest_city: dest,
+    pickup_city_display: placeLabel(origin || null, aliases) || origin,
+    dest_city_display: placeLabel(dest || null, aliases) || dest,
     pickup_address: row.pickupAddress ?? "",
     ride_at: rideAt(row.ride.time, row.message.timestamp),
     price: typeof row.ride.price === "number" && Number.isFinite(row.ride.price) ? row.ride.price : null,
-    notes: row.ride.notesLines.map(stripNoise).filter(Boolean).join("\n"),
+    notes: driveLinkNotes(row, options),
     dispatcher_name: row.message.sender_name ?? "",
     phone: (row.phone ?? "").replace(/\D/g, ""),
     wa_link: row.ride.waLink,

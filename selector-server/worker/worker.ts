@@ -7,6 +7,8 @@ import { assessRide } from "./lib/ride-status";
 import { autoEligible, MAX_ATTEMPTS, MAX_RIDES_PER_CALL, pushRides, toDriveLinkRide } from "./lib/drivelink";
 import { autoDismissRows, markDuplicatesExceptSplitParents } from "./lib/ride-rules";
 import { autoSplitRows } from "./lib/ride-split";
+import { lookupCandidates, photonPick, type PhotonFeature } from "./lib/place-lookup";
+import { splitPart } from "./lib/ride-parse";
 
 const SB_URL = process.env.SUPABASE_URL || "https://xxbstgdhtlalremiftwf.supabase.co";
 const SB_KEY = process.env.SUPABASE_KEY || "";
@@ -38,7 +40,7 @@ async function rpc<T>(fn: string, args: Record<string, unknown>): Promise<T> {
   return sb<T>(`rpc/${fn}`, { method: "POST", body: JSON.stringify({ p_token: WORKER_TOKEN, ...args }) });
 }
 type WorkerConfig = {
-  settings: { auto_transfer: boolean; auto_transfer_since: string | null } | null;
+  settings: { auto_transfer: boolean; auto_transfer_since: string | null; notes_template?: string | null } | null;
   keywords: PhoneKeyword[];
   note_filters: NoteFilter[];
 };
@@ -107,6 +109,28 @@ async function getStreetIndex() {
     if (!streetIndex) return new Map<string, string[]>();
   }
   return streetIndex!.index;
+}
+
+// ---------- Automatic place aliases (Photon) ----------
+// Unknown phrases in rides are looked up at most once each (cached in wa_place_lookups), one request
+// per cycle so the free Photon service is never flooded. Manual aliases always win (DB trigger).
+const PHOTON_URL = "https://photon.komoot.io/api/";
+let lookupKeys: Set<string> | null = null;
+const lookupQueue: string[] = [];
+async function photonStep(officialNames: string[]) {
+  const phrase = lookupQueue.shift();
+  if (!phrase) return null;
+  const key = cityKey(phrase);
+  if (!key || lookupKeys?.has(key)) return null;
+  lookupKeys?.add(key);
+  const params = new URLSearchParams({ q: phrase, bbox: "34.2,29.4,35.9,33.3", limit: "10" });
+  const res = await fetch(`${PHOTON_URL}?${params}`, { headers: { "User-Agent": "wa-selector-worker/1.0" }, signal: AbortSignal.timeout(8_000) });
+  if (!res.ok) { lookupKeys?.delete(key); throw new Error(`photon ${res.status}`); }
+  const json = (await res.json()) as { features?: PhotonFeature[] };
+  const pick = photonPick(phrase, json.features ?? [], officialNames);
+  const status = await rpc<string>("worker_lookup_result", { p_key: key, p_phrase: phrase, p_official: pick?.official_name ?? null, p_detail: pick?.detail ?? null });
+  if (pick && status === "matched") { log("auto alias:", phrase, "→", pick.official_name); if (configCache) configCache.at = 0; }
+  return pick;
 }
 
 // ---------- One cycle ----------
@@ -275,6 +299,22 @@ export async function cycle() {
   }
   if (splitCount) log("auto split:", splitCount, "messages");
 
+  // ---- Photon: queue unknown phrases of recent open rides that miss a place or were guessed internal.
+  if (!lookupKeys) lookupKeys = new Set(await rpc<string[]>("worker_lookup_keys", {}));
+  const knownNames = [...place.official.map((p) => p.name), ...customPlaces.map((c) => c.name)];
+  if (!lookupQueue.length) {
+    for (const row of base) {
+      if (lookupQueue.length >= 20) break;
+      if (row.override?.dismissed_at || !row.message.timestamp || Date.parse(row.message.timestamp) < Date.now() - 3 * 60 * 60_000) continue;
+      if (row.origin && row.destination && !row.ride.singlePlaceInferred) continue;
+      for (const phrase of lookupCandidates(row.ride, { knownNames, aliases: aliasRows, keywords, noteFilters, skipKeys: lookupKeys })) {
+        if (!lookupQueue.includes(phrase)) lookupQueue.push(phrase);
+      }
+    }
+  }
+  try { await photonStep(knownNames); }
+  catch (e) { log("photon failed:", String(e instanceof Error ? e.message : e)); }
+
   const needsStreets = base.some((row) => !row.override?.dismissed_at && (!row.origin || !row.destination || (row.ride.singlePlaceInferred && row.override?.destination == null)));
   const streets = needsStreets ? await getStreetIndex() : new Map<string, string[]>();
 
@@ -310,7 +350,10 @@ export async function cycle() {
       notesLineCount: row.ride.notesLines.length,
       internalConflict: row.ride.internalConflict, overridePhone: row.override?.phone ?? null, adminApproved: Boolean(row.override?.approved_at),
     });
+    const streetsHere = streetPhrases(row.ride).filter((p) => { const c = streets.get(cityKey(p)); return Boolean(c?.length && ((origin && c.includes(origin)) || (destination && c.includes(destination)))); });
+    const siblings = row.message.split_of ? messages.filter((m) => m.split_of === row.message.split_of).length : 0;
     finished.push({ message: row.message, ride: row.ride, groupName: row.groupName, origin, destination, pickupAddress, phone: a.phone, linkContact: a.linkContact, status: a.status,
+      streets: streetsHere, splitPart: splitPart(row.message.id, row.message.split_of, siblings),
       approved: Boolean(row.override?.approved_at), multiRides: new Array(row.multiRideCount).fill(0),
       dismissed: Boolean(row.override?.dismissed_at), splitParent: row.multiRideCount >= 2 || row.override?.dismiss_kind === "split" });
   }
@@ -331,6 +374,8 @@ export async function cycle() {
   const ready = [];
   for (const full of marked) {
     if (full.message.is_duplicate || full.dismissed || full.splitParent || full.status !== "ready" || !full.phone) continue;
+    // A guessed internal ride waits until its unknown words were looked up (they may be another city).
+    if (full.ride.singlePlaceInferred && lookupCandidates(full.ride, { knownNames, aliases: aliasRows, keywords, noteFilters, skipKeys: lookupKeys ?? new Set() }).length) continue;
     const t = transferMap.get(full.message.id);
     if (t && (t.status !== "error" || t.attempts >= MAX_ATTEMPTS)) continue;
     if (!autoEligible(full, since)) continue;
@@ -340,7 +385,9 @@ export async function cycle() {
 
   // Oldest waiting ride first, so nothing is starved behind newer messages.
   ready.sort((a, b) => (a.message.timestamp ?? "").localeCompare(b.message.timestamp ?? ""));
-  const batch = ready.slice(0, Math.min(PER_CYCLE, MAX_RIDES_PER_CALL)).map((r) => toDriveLinkRide(r));
+  const batch = ready.slice(0, Math.min(PER_CYCLE, MAX_RIDES_PER_CALL)).map((r) => toDriveLinkRide(r, { notesTemplate: settings?.notes_template ?? null, aliases: aliasRows }))
+    // DriveLink limits (notes 2000, original text 10000, names 80): never let a long template reject a ride.
+    .map((b) => ({ ...b, notes: b.notes.slice(0, 2000), original_text: b.original_text.slice(0, 10000), pickup_city_display: b.pickup_city_display.slice(0, 80), dest_city_display: b.dest_city_display.slice(0, 80) }));
   if (DRY_RUN) { log("DRY RUN would send:", JSON.stringify(batch.map((b) => [b.source_ref, b.pickup_city, b.dest_city, b.price]))); return { ready: ready.length, dry: true }; }
   if (!DL_URL || !DL_KEY) return { ready: ready.length, error: "DRIVELINK_INTAKE_URL / KEY missing in .env" };
   const results = await pushRides(batch, DL_URL, DL_KEY);
