@@ -5,6 +5,7 @@ import { cityKey } from "./lib/city-match";
 import { applyStreetResolution, parseRide, rideTextPhones, splitRideBlocks, streetPhrases, type NoteFilter, type OfficialPlace, type PhoneKeyword, type PlaceAlias, type PlaceOptions } from "./lib/ride-parse";
 import { assessRide } from "./lib/ride-status";
 import { autoEligible, MAX_ATTEMPTS, MAX_RIDES_PER_CALL, pushRides, toDriveLinkRide } from "./lib/drivelink";
+import { markDuplicates } from "./lib/ride-rules";
 
 const SB_URL = process.env.SUPABASE_URL || "https://xxbstgdhtlalremiftwf.supabase.co";
 const SB_KEY = process.env.SUPABASE_KEY || "";
@@ -109,8 +110,12 @@ async function getStreetIndex() {
 
 // ---------- One cycle ----------
 type Msg = { id: string; split_of: string | null; group_id: string | null; group_name: string | null; body: string | null; timestamp: string | null; sender_name: string | null; sender_phone: string | null; is_duplicate: boolean };
-type Override = { message_id: string; origin: string | null; destination: string | null; phone_choice: string | null; dismissed_at: string | null; price: number | null; ride_time: string | null; notes: string | null; phone: string | null; wa_link: string | null; tg_link: string | null; approved_at: string | null };
+type Override = { message_id: string; origin: string | null; destination: string | null; phone_choice: string | null; dismissed_at: string | null; dismiss_kind?: string | null; price: number | null; ride_time: string | null; notes: string | null; phone: string | null; wa_link: string | null; tg_link: string | null; approved_at: string | null };
 type Transfer = { message_id: string; status: string; attempts: number };
+
+// Parse results per message (re-parsed only when the message, its override or the settings change).
+type BaseRow = { message: Msg; ride: ReturnType<typeof parseRide>; override: Override | undefined; multiRideCount: number; inheritedPhoneAmbiguous: boolean; groupName: string; origin: string | null; destination: string | null };
+const baseCache = new Map<string, { key: string; value: BaseRow }>();
 
 // ---------- Incremental loading (keeps Supabase traffic small) ----------
 const FULL_MESSAGES_MS = 30 * 60_000;
@@ -124,7 +129,7 @@ async function fetchMessages(ids: string[], filter: string): Promise<CachedMsg[]
   const out: CachedMsg[] = [];
   for (let i = 0; i < ids.length; i += 100) {
     const chunk = ids.slice(i, i + 100);
-    out.push(...await sbAll<CachedMsg>(`wa_messages?select=${MSG_COLS}&is_duplicate=eq.false&${filter}&group_id=in.${encodeURIComponent(inList(chunk))}&order=created_at.asc`));
+    out.push(...await sbAll<CachedMsg>(`wa_messages?select=${MSG_COLS}&${filter}&group_id=in.${encodeURIComponent(inList(chunk))}&order=created_at.asc`));
   }
   return out;
 }
@@ -200,7 +205,9 @@ export async function cycle() {
   const settings = (await rpc<WorkerConfig>("worker_config", {})).settings;
   if (!settings?.auto_transfer || !settings.auto_transfer_since) return { skipped: "auto transfer is off" };
   const since = settings.auto_transfer_since;
-  const from = new Date(Math.max(Date.parse(since), Date.now() - DAY)).toISOString();
+  // Duplicates are decided like the app: over every ride of the last 24 hours (dismissed ones too),
+  // so the window here is always 24h; autoEligible(since) still limits what is sent.
+  const from = new Date(Date.now() - DAY).toISOString();
 
   const groups = await sbAll<{ id: string; name: string }>("wa_groups?select=id,name&enabled=eq.true&pending_review=eq.false&order=id");
   if (!groups.length) return { skipped: "no active groups" };
@@ -214,15 +221,26 @@ export async function cycle() {
   const byId = new Map(messages.map((m) => [m.id, m]));
 
   // buildBase (same as useRideBoard)
+  const configKey = JSON.stringify([aliasRows.length, customPlaces.length, keywords, noteFilters, place.official.length, config.at]);
   const base = messages.map((message) => {
+    const o = overrideMap.get(message.id);
+    const parent = message.split_of ? byId.get(message.split_of) : null;
+    const key = JSON.stringify([configKey, message.body, message.group_id, o ?? null, parent?.body ?? null, groupName.get(message.group_id ?? "") ?? null]);
+    const hit = baseCache.get(message.id);
+    if (hit && hit.key === key) return { ...hit.value, message };
+    const value = buildBase(message, o, parent ?? null);
+    baseCache.set(message.id, { key, value });
+    return value;
+  }).filter((row) => row.ride.isRide);
+  for (const id of baseCache.keys()) if (!byId.has(id)) baseCache.delete(id);
+
+  function buildBase(message: Msg, o: Override | undefined, parent: Msg | null) {
     const parsed = parseRide(message.body ?? "", parseOptions);
     const multi = message.split_of ? { blocks: [], shared: [] } : splitRideBlocks(message.body ?? "", parseOptions);
-    const parent = message.split_of ? byId.get(message.split_of) : null;
     const childIndex = message.split_of ? Number(message.id.slice(message.split_of.length + 1)) - 1 : -1;
     const ownBlock = parent ? splitRideBlocks(parent.body ?? "", parseOptions).blocks[childIndex]?.text : null;
     const childHasPhone = rideTextPhones(ownBlock ?? message.body ?? "", keywords).length > 0;
     const inheritedPhoneAmbiguous = Boolean(parent && !childHasPhone && rideTextPhones(parent.body ?? "", keywords).length > 1);
-    const o = overrideMap.get(message.id);
     const ride = o ? {
       ...parsed,
       price: o.price ?? parsed.price,
@@ -238,13 +256,13 @@ export async function cycle() {
       origin: o?.origin ?? ride.origin,
       destination: o?.destination ?? ride.destination,
     };
-  }).filter((row) => row.ride.isRide && !row.override?.dismissed_at);
+  }
 
-  const needsStreets = base.some((row) => !row.origin || !row.destination);
+  const needsStreets = base.some((row) => !row.override?.dismissed_at && (!row.origin || !row.destination));
   const streets = needsStreets ? await getStreetIndex() : new Map<string, string[]>();
 
   // finish (same as useRideBoard) + status
-  const ready = [];
+  const finished = [];
   for (const row of base) {
     const { origin, destination } = row;
     let pickupAddress = "";
@@ -269,9 +287,16 @@ export async function cycle() {
       notesLineCount: row.ride.notesLines.length,
       internalConflict: row.ride.internalConflict, overridePhone: row.override?.phone ?? null, adminApproved: Boolean(row.override?.approved_at),
     });
-    if (a.status !== "ready") continue;
-    const full = { message: row.message, ride: row.ride, groupName: row.groupName, origin, destination, pickupAddress, phone: a.phone };
-    const t = transferMap.get(row.message.id);
+    finished.push({ message: row.message, ride: row.ride, groupName: row.groupName, origin, destination, pickupAddress, phone: a.phone, linkContact: a.linkContact, status: a.status,
+      dismissed: Boolean(row.override?.dismissed_at), splitParent: row.multiRideCount >= 2 || row.override?.dismiss_kind === "split" });
+  }
+  // Duplicate = same dispatcher name + phone (or link) + origin + destination + price (app's markDuplicates).
+  // A split parent is only a container for its rides, so it never makes its own first ride a duplicate.
+  const marked = markDuplicates(finished.filter((r) => !r.splitParent));
+  const ready = [];
+  for (const full of marked) {
+    if (full.message.is_duplicate || full.dismissed || full.status !== "ready") continue;
+    const t = transferMap.get(full.message.id);
     if (t && (t.status !== "error" || t.attempts >= MAX_ATTEMPTS)) continue;
     if (!autoEligible(full, since)) continue;
     ready.push(full);

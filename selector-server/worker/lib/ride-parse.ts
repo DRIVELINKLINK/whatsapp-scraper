@@ -10,6 +10,9 @@ export type Ride = {
   origin: string | null;
   destination: string | null;
   price: number | null;
+  passengers: number | null;
+  luggage: number | null;
+  femaleDriver: boolean;
   time: string | null;
   notes: string;
   notesLines: string[];
@@ -182,12 +185,27 @@ function matchCity(words: string[], index: number, lookup: Lookup): { city: stri
 export function isValidRidePrice(amount: number): boolean {
   return Number.isInteger(amount) && amount >= 20 && amount <= 2000 && amount % 10 === 0;
 }
+/** Metadata is extracted independently; its numbers are masked only in price scanning. */
+export function rideExtras(text: string) {
+  const normalized = clean(text);
+  const passengerPattern = /(?<![\d\p{L}])(?:(\d+)\s*(?:מקומות|מקום|נוסעים|נוסע|מק['׳’])|(?:נוסע|מקום)\s+אחד)(?![\p{L}\d])/gu;
+  const luggagePattern = /(?<![\d\p{L}])(?:(\d+)\s*מזוודות|מזוודה(?:\s+גדולה)?|(\d+)\s*[גק])(?![\p{L}\d])/gu;
+  let passengers: number | null = null;
+  let luggage: number | null = null;
+  const masked = normalized.replace(passengerPattern, (_match, count: string | undefined) => {
+    passengers ??= count ? Number(count) : 1; return " ".repeat(_match.length);
+  }).replace(luggagePattern, (_match, count: string | undefined, short: string | undefined) => {
+    luggage = (luggage ?? 0) + Number(count ?? short ?? 1); return " ".repeat(_match.length);
+  });
+  return { passengers, luggage, femaleDriver: /(?<![\p{L}])נהגת(?![\p{L}])/u.test(normalized), masked };
+}
 export function parseRide(text: string, options: PlaceOptions | PhoneKeyword[] = {}): Ride {
   const placeOptions: PlaceOptions = Array.isArray(options) ? { keywords: options } : options;
   const keywords = placeOptions.keywords ?? DEFAULT_PHONE_KEYWORDS;
   const lookup = buildLookup(placeOptions);
   const noteFilters = placeOptions.noteFilters ?? [];
   const links = extractLinks(text, noteFilters);
+  const { passengers, luggage, femaleDriver } = rideExtras(text);
   const verifiedLink = hasVerifiedDispatchLink(text, keywords, noteFilters);
   const dispatcherPhone = verifiedLink ? null : extractDispatcherPhone(text, keywords);
   // Keep an intact cleaned line for notes; use a separate token source for extraction.
@@ -206,26 +224,36 @@ export function parseRide(text: string, options: PlaceOptions | PhoneKeyword[] =
   const currencyPattern = /(?<![\d\p{L}])(\d+(?:\.\d+)?)\s*(?:ש["״']?ח|ש|₪)(?=$|[\s,;.!?&+])/gu;
   const barePattern = /(?<![\d\p{L}.])(\d+(?:\.\d+)?)(?![\d\p{L}.])/gu;
   // Explicit currency prices win over bare numbers, regardless of line order.
-  const sources = withoutTimes.map(line => line.replace(currencyPattern, (match, amount: string) => {
-    const value = Number(amount);
+  const priceLines = withoutTimes.map(line => rideExtras(line).masked);
+  let selectedBare: { line: number; index: number; raw: string } | null = null;
+  const sources = priceLines.map(line => line.replace(currencyPattern, (match, amount: string) => {
+    const value = Math.floor(Number(amount) / 10 + 0.5) * 10;
     if (isValidRidePrice(value)) { if (price === null) { price = value; explicitPrice = true; return " "; } return match; }
     invalidCandidate = true;
     return match;
   }));
   if (price === null) {
-    for (const line of sources) {
+    for (const [lineIndex, line] of sources.entries()) {
+      const words = line.replace(/[,;:!?…()\[\]{}→/\\|_~&+]/g, " ").trim().split(/\s+/);
+      if (!words.some((_word, index) => matchCity(words, index, lookup))) continue;
       for (const match of line.matchAll(barePattern)) {
-        const amount = Number(match[1]);
-        if (isValidRidePrice(amount)) { price = amount; break; }
-        if (amount >= 20 && amount <= 2000) invalidCandidate = true;
+        const amount = Math.floor(Number(match[1]) / 10 + 0.5) * 10;
+        if (isValidRidePrice(amount)) { price = amount; selectedBare = {line:lineIndex,index:match.index,raw:match[0]}; break; }
       }
       if (price !== null) break;
     }
   }
   const priceUnsure = price === null && invalidCandidate;
-  let bareConsumed = false;
-  const tokenLines = sources.map(line => line.replace(barePattern, (match, amount: string) => {
-    if (!explicitPrice && !bareConsumed && Number(amount) === price) { bareConsumed = true; return " "; }
+  // Extraction masks must not erase passenger/luggage notes or residual-word safety.
+  let currencyConsumed = false;
+  const tokenLines = withoutTimes.map((line, lineIndex) => line.replace(currencyPattern, (match, amount: string) => {
+    if (explicitPrice && !currencyConsumed && Math.floor(Number(amount)/10+0.5)*10 === price) { currencyConsumed=true; return " "; }
+    return match;
+  }).replace(barePattern, (match, _amount: string, offset: number) => {
+    if (!explicitPrice && selectedBare?.line === lineIndex && selectedBare.raw === match && priceLines[lineIndex]?.slice(offset,offset+match.length) === match) {
+      // Only consume the chosen occurrence (metadata masks preserve offsets below).
+      if (offset === selectedBare.index) return " ";
+    }
     return match;
   }).replace(/[,;:!?…()\[\]{}→/\\|_~&+]/g, " ").trim().split(/\s+/).filter(Boolean));
   let origin: string | null = null, destination: string | null = null;
@@ -285,7 +313,7 @@ export function parseRide(text: string, options: PlaceOptions | PhoneKeyword[] =
   }
   return {
     isRide: origin !== null || price !== null || time !== null || priceUnsure,
-    origin, destination, price, time, notes: notesLines.join(" · "), notesLines,
+    origin, destination, price, passengers, luggage, femaleDriver, time, notes: notesLines.join(" · "), notesLines,
     dispatcherPhone, originToken, destinationToken, ...links,
     internalConflict: !internalHit?.full && others.size >= 2,
     singlePlaceUnsure, priceUnsure, verifiedLink,

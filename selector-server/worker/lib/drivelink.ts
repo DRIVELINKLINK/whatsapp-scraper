@@ -1,8 +1,10 @@
 // Copied from the WhatsApp Selector app (src/lib/drivelink.ts). Keep in sync.
+/** Pure DriveLink mapping + push logic (no secrets here; the server fn supplies them). */
 export type DriveLinkRide = {
   source_ref: string; pickup_city: string; dest_city: string; pickup_address: string; ride_at: string;
   price: number | null; notes: string; dispatcher_name: string; phone: string; wa_link: string | null; tg_link: string | null;
   group_name: string; original_text: string;
+  passengers: number | null; luggage: number | null; female_driver: boolean;
 };
 export type PushResult = { source_ref: string; ok: boolean; ride_number?: number | undefined; duplicate?: boolean | undefined; error?: string | undefined };
 export const MAX_RIDES_PER_CALL = 20;
@@ -21,7 +23,7 @@ export function rideAt(time: string | null, messageIso: string | null): string {
 
 export type MappableRide = {
   message: { id: string; body: string | null; timestamp: string | null; sender_name: string | null };
-  ride: { price: number | null; time: string | null; notesLines: string[]; waLink: string | null; tgLink: string | null };
+  ride: { price: number | null; time: string | null; notesLines: string[]; waLink: string | null; tgLink: string | null; passengers?: number | null; luggage?: number | null; femaleDriver?: boolean };
   groupName: string; origin: string | null; destination: string | null; phone: string | null; pickupAddress?: string;
 };
 const stripNoise = (line: string) => line
@@ -46,6 +48,9 @@ export function toDriveLinkRide(row: MappableRide): DriveLinkRide {
     tg_link: row.ride.tgLink,
     group_name: row.groupName,
     original_text: row.message.body ?? "",
+    passengers: row.ride.passengers ?? null,
+    luggage: row.ride.luggage ?? null,
+    female_driver: row.ride.femaleDriver ?? false,
   };
 }
 
@@ -73,5 +78,10 @@ const HOUR = 60 * 60_000;
 export function autoEligible(row: MappableRide, since: string | null, now = Date.now()): boolean {
   if (!since || !row.message.timestamp) return false;
   if (Date.parse(row.message.timestamp) < Date.parse(since)) return false;
+  return Date.parse(rideAt(row.ride.time, row.message.timestamp)) >= now - HOUR;
+}
+/** Manual bulk send: rides from the last 2 hours whose ride time is not >60 min past. */
+export function manualEligible(row: MappableRide, now = Date.now()): boolean {
+  if (!row.message.timestamp || Date.parse(row.message.timestamp) < now - 2 * HOUR) return false;
   return Date.parse(rideAt(row.ride.time, row.message.timestamp)) >= now - HOUR;
 }
