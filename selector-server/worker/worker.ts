@@ -422,8 +422,8 @@ export async function sendNext() {
   if (DRY_RUN) { log("DRY RUN would send:", JSON.stringify(batch.map((b) => [b.source_ref, b.pickup_city, b.dest_city, b.price]))); return { dry: true }; }
   if (!DL_URL || !DL_KEY) return { error: "DRIVELINK_INTAKE_URL / KEY missing in .env" };
   const transferMap = transferCache;
-  const results = await pushRides(batch, DL_URL, DL_KEY);
   stats.lastSendAt = Date.now();
+  const results = await pushRides(batch, DL_URL, DL_KEY);
   const rows = results.map((res) => ({
     message_id: res.source_ref,
     status: res.ok ? (res.duplicate ? "duplicate" : "sent") : "error",
@@ -460,21 +460,23 @@ if (process.env.WORKER_NO_LOOP !== "1") (async function main() {
         lastError = String(e instanceof Error ? e.message : e).slice(0, 300);
         log("cycle error:", lastError);
       }
-      await sleep(2_000);
+      await sleep(1_000);
     }
   };
-  // Send loop: one ride every INTERVAL, independent of how long processing takes.
+  // Send loop: a ready ride goes out at once, but never sooner than INTERVAL after the previous one.
   const sendLoop = async () => {
     for (;;) {
-      const started = Date.now();
-      try {
-        const result = await sendNext();
-        if (Object.keys(result).length) log(JSON.stringify(result), `queue ${stats.queue}`);
-      } catch (e) {
-        lastError = String(e instanceof Error ? e.message : e).slice(0, 300);
-        log("send error:", lastError);
+      if (readyQueue.length && Date.now() - stats.lastSendAt >= INTERVAL) {
+        try {
+          const result = await sendNext();
+          if (Object.keys(result).length) log(JSON.stringify(result), `queue ${stats.queue}`);
+        } catch (e) {
+          lastError = String(e instanceof Error ? e.message : e).slice(0, 300);
+          log("send error:", lastError);
+          stats.lastSendAt = Date.now();
+        }
       }
-      await sleep(Math.max(0, INTERVAL - (Date.now() - started)));
+      await sleep(200);
     }
   };
   // Sign of life once a minute (row id "worker" in wa_status) with speed numbers.
