@@ -10,7 +10,9 @@ const SB_URL = process.env.SUPABASE_URL || "https://xxbstgdhtlalremiftwf.supabas
 const SB_KEY = process.env.SUPABASE_KEY || "";
 const DL_URL = process.env.DRIVELINK_INTAKE_URL || "";
 const DL_KEY = process.env.DRIVELINK_INTAKE_KEY || "";
-const INTERVAL = Number(process.env.WORKER_INTERVAL_MS || 20_000);
+// One ride every 5 seconds: steady flow, drivers never get a burst of rides at once.
+const INTERVAL = Number(process.env.WORKER_INTERVAL_MS || 5_000);
+const PER_CYCLE = Math.max(1, Number(process.env.WORKER_RIDES_PER_CYCLE || 1));
 const DRY_RUN = process.env.DRY_RUN === "1";
 // Private key for the worker-only database functions (settings, keywords, filters and overrides are
 // locked to signed-in users in the app, so the worker reads them through worker_config / worker_overrides).
@@ -276,7 +278,9 @@ export async function cycle() {
   }
   if (!ready.length) return { messages: messages.length, ready: 0 };
 
-  const batch = ready.slice(0, MAX_RIDES_PER_CALL).map((r) => toDriveLinkRide(r));
+  // Oldest waiting ride first, so nothing is starved behind newer messages.
+  ready.sort((a, b) => (a.message.timestamp ?? "").localeCompare(b.message.timestamp ?? ""));
+  const batch = ready.slice(0, Math.min(PER_CYCLE, MAX_RIDES_PER_CALL)).map((r) => toDriveLinkRide(r));
   if (DRY_RUN) { log("DRY RUN would send:", JSON.stringify(batch.map((b) => [b.source_ref, b.pickup_city, b.dest_city, b.price]))); return { ready: ready.length, dry: true }; }
   if (!DL_URL || !DL_KEY) return { ready: ready.length, error: "DRIVELINK_INTAKE_URL / KEY missing in .env" };
   const results = await pushRides(batch, DL_URL, DL_KEY);
@@ -300,7 +304,7 @@ export async function cycle() {
 if (process.env.WORKER_NO_LOOP !== "1") (async function loop() {
   if (!SB_KEY) { log("SUPABASE_KEY missing in .env"); process.exit(1); }
   if (!WORKER_TOKEN) log("WORKER_TOKEN missing in .env — settings/keywords/overrides cannot be read");
-  log("worker started", { interval: INTERVAL, dryRun: DRY_RUN, drivelink: Boolean(DL_URL && DL_KEY) });
+  log("worker started", { interval: INTERVAL, perCycle: PER_CYCLE, dryRun: DRY_RUN, drivelink: Boolean(DL_URL && DL_KEY) });
   let last = "";
   let lastBeat = 0;
   let lastError: string | null = null;
