@@ -1,8 +1,8 @@
 // WhatsApp Selector — server-side DriveLink transfer.
 // Same pipeline as the Transfer screen (useRideBoard + useDriveLink), so rides keep flowing
 // to DriveLink while no browser is open. Uses the exact parsing files of the app (./lib).
-import { cityKey, sheetToRows, type CityRow } from "./lib/city-match";
-import { applyStreetResolution, parseRide, streetPhrases, type NoteFilter, type OfficialPlace, type PhoneKeyword, type PlaceAlias } from "./lib/ride-parse";
+import { cityKey } from "./lib/city-match";
+import { applyStreetResolution, parseRide, rideTextPhones, splitRideBlocks, streetPhrases, type NoteFilter, type OfficialPlace, type PhoneKeyword, type PlaceAlias, type PlaceOptions } from "./lib/ride-parse";
 import { assessRide } from "./lib/ride-status";
 import { autoEligible, MAX_ATTEMPTS, MAX_RIDES_PER_CALL, pushRides, toDriveLinkRide } from "./lib/drivelink";
 
@@ -41,18 +41,16 @@ const inList = (ids: string[]) => `(${ids.map((id) => `"${id.replace(/"/g, '\\"'
 const GOV_URL = "https://data.gov.il/api/3/action/datastore_search";
 const CITIES_RESOURCE = "5c78e9fa-c2e2-4771-93ff-7f400a12f7ba";
 const STREETS_RESOURCE = "9ad3862c-8391-4b2f-84a4-2d4c68625f4b";
-const SHEET_URL = "https://docs.google.com/spreadsheets/d/1cc0ji7L5c06teG130uVxfO0HafaiwKH4AIubuE0Mimg/export?format=csv&gid=0";
 type GovRecord = Record<string, unknown>;
 const govJson = async (params: URLSearchParams) => {
   const res = await fetch(`${GOV_URL}?${params}`, { signal: AbortSignal.timeout(60_000) });
   if (!res.ok) throw new Error(`data.gov.il ${res.status}`);
   return (await res.json()) as { result?: { records?: GovRecord[] } };
 };
-let places: { at: number; official: OfficialPlace[]; sheet: CityRow[] } | null = null;
+let places: { at: number; official: OfficialPlace[] } | null = null;
 async function getPlaces() {
   if (places && Date.now() - places.at < DAY) return places;
   const official: OfficialPlace[] = [];
-  let sheet: CityRow[] = places?.sheet ?? [];
   try {
     const json = await govJson(new URLSearchParams({ resource_id: CITIES_RESOURCE, limit: "2000" }));
     const seen = new Set<string>();
@@ -63,12 +61,8 @@ async function getPlaces() {
       official.push({ name, code: String(rec["סמל_ישוב"] ?? "") });
     }
   } catch (e) { log("official cities failed:", String(e)); }
-  try {
-    const res = await fetch(SHEET_URL, { signal: AbortSignal.timeout(20_000) });
-    if (res.ok) sheet = sheetToRows(await res.text());
-  } catch (e) { log("sheet failed:", String(e)); }
-  if (official.length) places = { at: Date.now(), official, sheet };
-  else if (!places) places = { at: 0, official: [], sheet }; // retry next cycle
+  if (official.length) places = { at: Date.now(), official };
+  else if (!places) places = { at: 0, official: [] }; // retry next cycle
   return places;
 }
 let streetIndex: { at: number; index: Map<string, string[]> } | null = null;
@@ -101,7 +95,7 @@ async function getStreetIndex() {
 }
 
 // ---------- One cycle ----------
-type Msg = { id: string; group_id: string | null; group_name: string | null; body: string | null; timestamp: string | null; sender_name: string | null; sender_phone: string | null; is_duplicate: boolean };
+type Msg = { id: string; split_of: string | null; group_id: string | null; group_name: string | null; body: string | null; timestamp: string | null; sender_name: string | null; sender_phone: string | null; is_duplicate: boolean };
 type Override = { message_id: string; origin: string | null; destination: string | null; phone_choice: string | null; dismissed_at: string | null; price: number | null; ride_time: string | null; notes: string | null; phone: string | null; wa_link: string | null; tg_link: string | null; approved_at: string | null };
 type Transfer = { message_id: string; status: string; attempts: number };
 
@@ -109,7 +103,7 @@ type Transfer = { message_id: string; status: string; attempts: number };
 const FULL_MESSAGES_MS = 30 * 60_000;
 const FULL_SMALL_MS = 10 * 60_000;
 const CONFIG_MS = 60_000;
-const MSG_COLS = "id,group_id,group_name,body,timestamp,sender_name,sender_phone,is_duplicate,created_at";
+const MSG_COLS = "id,split_of,group_id,group_name,body,timestamp,sender_name,sender_phone,is_duplicate,created_at";
 type CachedMsg = Msg & { created_at: string };
 const msgCache = new Map<string, CachedMsg>();
 let msgState = { at: 0, groups: "", from: "", lastCreated: "" };
@@ -143,16 +137,17 @@ async function loadMessages(ids: string[], from: string): Promise<Msg[]> {
   return [...msgCache.values()].sort((a, b) => (b.timestamp ?? "").localeCompare(a.timestamp ?? ""));
 }
 
-let configCache: { at: number; aliasRows: PlaceAlias[]; keywords: PhoneKeyword[]; noteFilters: NoteFilter[] } | null = null;
+let configCache: { at: number; aliasRows: PlaceAlias[]; customPlaces: { name: string }[]; keywords: PhoneKeyword[]; noteFilters: NoteFilter[] } | null = null;
 async function loadConfig() {
   if (configCache && Date.now() - configCache.at < CONFIG_MS) return configCache;
-  const [aliasRows, keywordRows, filterRows] = await Promise.all([
+  const [aliasRows, customPlaces, keywordRows, filterRows] = await Promise.all([
     sbAll<PlaceAlias>("wa_place_aliases?select=alias,official_name,is_display,keep_in_notes,use_for_parse,is_hero&order=alias"),
+    sbAll<{ name: string }>("wa_custom_places?select=name&order=name"),
     sbAll<PhoneKeyword>("wa_phone_keywords?select=phrase,kind&order=phrase"),
     sbAll<NoteFilter>("wa_note_filters?select=phrase,kind&order=phrase"),
   ]);
   configCache = {
-    at: Date.now(), aliasRows,
+    at: Date.now(), aliasRows, customPlaces,
     keywords: keywordRows.filter((k) => k.kind === "dispatcher" || k.kind === "ignore"),
     noteFilters: filterRows.filter((f) => f.kind === "line" || f.kind === "link"),
   };
@@ -200,17 +195,19 @@ export async function cycle() {
   if (!messages.length) return { messages: 0 };
 
   const [config, overrideMap, transferMap, place] = await Promise.all([loadConfig(), loadOverrides(), loadTransfers(), getPlaces()]);
-  const { aliasRows, keywords, noteFilters } = config;
+  const { aliasRows, customPlaces, keywords, noteFilters } = config;
+  const parseOptions: PlaceOptions = { aliases: aliasRows, official: place.official.length ? place.official : undefined, custom: customPlaces, keywords, noteFilters };
+  const byId = new Map(messages.map((m) => [m.id, m]));
 
   // buildBase (same as useRideBoard)
   const base = messages.map((message) => {
-    const parsed = parseRide(message.body ?? "", {
-      aliases: aliasRows,
-      official: place.official.length ? place.official : undefined,
-      sheet: place.sheet.length ? place.sheet : undefined,
-      keywords,
-      noteFilters,
-    });
+    const parsed = parseRide(message.body ?? "", parseOptions);
+    const multi = message.split_of ? { blocks: [], shared: [] } : splitRideBlocks(message.body ?? "", parseOptions);
+    const parent = message.split_of ? byId.get(message.split_of) : null;
+    const childIndex = message.split_of ? Number(message.id.slice(message.split_of.length + 1)) - 1 : -1;
+    const ownBlock = parent ? splitRideBlocks(parent.body ?? "", parseOptions).blocks[childIndex]?.text : null;
+    const childHasPhone = rideTextPhones(ownBlock ?? message.body ?? "", keywords).length > 0;
+    const inheritedPhoneAmbiguous = Boolean(parent && !childHasPhone && rideTextPhones(parent.body ?? "", keywords).length > 1);
     const o = overrideMap.get(message.id);
     const ride = o ? {
       ...parsed,
@@ -222,7 +219,7 @@ export async function cycle() {
       tgLink: o.tg_link ?? parsed.tgLink,
     } : parsed;
     return {
-      message, ride, override: o,
+      message, ride, override: o, multiRideCount: multi.blocks.length >= 2 ? multi.blocks.length : 0, inheritedPhoneAmbiguous,
       groupName: groupName.get(message.group_id ?? "") ?? message.group_name ?? "—",
       origin: o?.origin ?? ride.origin,
       destination: o?.destination ?? ride.destination,
@@ -235,22 +232,27 @@ export async function cycle() {
   // finish (same as useRideBoard) + status
   const ready = [];
   for (const row of base) {
-    let { origin, destination } = row;
+    const { origin, destination } = row;
     let pickupAddress = "";
     if (!origin || !destination) {
+      // Streets are suggestions only (same as the app); they never fill origin/destination.
       const phrases = streetPhrases(row.ride);
-      const street = applyStreetResolution({ origin, destination, phrases, resolve: (p) => streets.get(cityKey(p)) });
-      origin = street.origin;
-      destination = street.destination;
+      applyStreetResolution({ origin, destination, phrases, resolve: (p) => streets.get(cityKey(p)) });
       pickupAddress = phrases.find((p) => { const c = streets.get(cityKey(p)); return c?.length === 1 && c[0] === origin; }) ?? "";
     }
     if (!pickupAddress && row.ride.originToken) {
       const k = cityKey(row.ride.originToken);
       if (aliasRows.some((a) => a.keep_in_notes && cityKey(a.alias) === k)) pickupAddress = row.ride.originToken;
     }
+    // Same arguments as useRideBoard.finish in the app.
     const a = assessRide({
+      multiRideCount: row.multiRideCount, inheritedPhoneAmbiguous: row.inheritedPhoneAmbiguous,
       text: row.message.body ?? "", origin, destination, senderPhone: row.message.sender_phone, keywords,
       phoneChoice: row.override?.phone_choice ?? null, hasLink: Boolean(row.ride.waLink || row.ride.tgLink),
+      verifiedLink: row.ride.verifiedLink,
+      singlePlaceUnsure: row.ride.singlePlaceUnsure && !row.destination,
+      priceUnsure: row.ride.priceUnsure && row.ride.price === null,
+      notesLineCount: row.ride.notesLines.length,
       internalConflict: row.ride.internalConflict, overridePhone: row.override?.phone ?? null, adminApproved: Boolean(row.override?.approved_at),
     });
     if (a.status !== "ready") continue;
