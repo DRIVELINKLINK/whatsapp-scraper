@@ -232,11 +232,14 @@ async function loadTransfers() {
 // Sending never waits for the heavy processing, so the gap between rides stays exactly INTERVAL.
 type Payload = ReturnType<typeof toDriveLinkRide>;
 let readyQueue: Payload[] = [];
-export const stats = { cycleMs: 0, queue: 0, lastSendAt: 0 };
+export const stats = { cycleMs: 0, readMs: 0, queue: 0, lastSendAt: 0 };
+let photonNames: string[] = [];
+export async function photonTick() { if (photonNames.length) await photonStep(photonNames); }
 
 export async function cycle() {
   const processed = await processCycle();
   const sent = await sendNext();
+  await photonTick();
   return { ...processed, ...sent };
 }
 
@@ -246,7 +249,14 @@ export async function processCycle() {
 }
 
 async function processInner() {
-  const settings = (await rpc<WorkerConfig>("worker_config", {})).settings;
+  const t0 = Date.now();
+  // All reads in parallel: one network round trip instead of six in a row.
+  const [workerCfg, groups, config, overrideMap, transferMap, place] = await Promise.all([
+    rpc<WorkerConfig>("worker_config", {}),
+    sbAll<{ id: string; name: string }>("wa_groups?select=id,name&enabled=eq.true&pending_review=eq.false&order=id"),
+    loadConfig(), loadOverrides(), loadTransfers(), getPlaces(),
+  ]);
+  const settings = workerCfg.settings;
   // Splitting and auto-removal always run; only the sending to DriveLink depends on the switch.
   const sending = Boolean(settings?.auto_transfer && settings.auto_transfer_since);
   const since = settings?.auto_transfer_since ?? null;
@@ -254,13 +264,11 @@ async function processInner() {
   // so the window here is always 24h; autoEligible(since) still limits what is sent.
   const from = new Date(Date.now() - DAY).toISOString();
 
-  const groups = await sbAll<{ id: string; name: string }>("wa_groups?select=id,name&enabled=eq.true&pending_review=eq.false&order=id");
   if (!groups.length) return { skipped: "no active groups" };
   const groupName = new Map(groups.map((g) => [g.id, g.name]));
   const messages = await loadMessages(groups.map((g) => g.id), from);
   if (!messages.length) return { messages: 0 };
-
-  const [config, overrideMap, transferMap, place] = await Promise.all([loadConfig(), loadOverrides(), loadTransfers(), getPlaces()]);
+  stats.readMs = Date.now() - t0;
   const { aliasRows, customPlaces, keywords, noteFilters } = config;
   const parseOptions: PlaceOptions = { aliases: aliasRows, official: place.official.length ? place.official : undefined, custom: customPlaces, keywords, noteFilters };
   const byId = new Map(messages.map((m) => [m.id, m]));
@@ -330,8 +338,8 @@ async function processInner() {
       }
     }
   }
-  try { await photonStep(knownNames); }
-  catch (e) { log("photon failed:", String(e instanceof Error ? e.message : e)); }
+  // Photon runs in its own loop (see main) so a slow lookup never delays rides.
+  photonNames = knownNames;
 
   const needsStreets = base.some((row) => !row.override?.dismissed_at && (!row.origin || !row.destination || (row.ride.singlePlaceInferred && row.override?.destination == null)));
   const streets = needsStreets ? await getStreetIndex() : new Map<string, string[]>();
@@ -483,10 +491,17 @@ if (process.env.WORKER_NO_LOOP !== "1") (async function main() {
   const beatLoop = async () => {
     for (;;) {
       await sb("wa_status?on_conflict=id", { method: "POST", headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
-        body: JSON.stringify([{ id: "worker", last_heartbeat: new Date().toISOString(), version: `worker · cycle ${(stats.cycleMs / 1000).toFixed(1)}s · queue ${stats.queue}`, pending: stats.queue, last_error: lastError }]) })
+        body: JSON.stringify([{ id: "worker", last_heartbeat: new Date().toISOString(), version: `worker · cycle ${(stats.cycleMs / 1000).toFixed(1)}s · read ${(stats.readMs / 1000).toFixed(1)}s · queue ${stats.queue}`, pending: stats.queue, last_error: lastError }]) })
         .catch((e) => log("heartbeat failed:", String(e)));
       await sleep(60_000);
     }
   };
-  await Promise.all([processLoop(), sendLoop(), beatLoop()]);
+  // Photon loop: at most one lookup every 3 seconds, independent of processing and sending.
+  const photonLoop = async () => {
+    for (;;) {
+      try { await photonTick(); } catch (e) { log("photon failed:", String(e instanceof Error ? e.message : e)); }
+      await sleep(3_000);
+    }
+  };
+  await Promise.all([processLoop(), sendLoop(), beatLoop(), photonLoop()]);
 })();
