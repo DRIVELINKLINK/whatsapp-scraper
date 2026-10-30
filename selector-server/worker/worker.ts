@@ -119,6 +119,29 @@ async function getStreetIndex() {
 const PHOTON_URL = "https://photon.komoot.io/api/";
 let lookupKeys: Set<string> | null = null;
 const lookupQueue: string[] = [];
+// Server-side safety rules on top of photonPick (the admin's rules, 30.10):
+// - never buildings, schools or colleges (a building/school name is not a place);
+// - never a name that also exists as a street anywhere in the official street list;
+// - a one-word name only when it is a neighbourhood/suburb/quarter whose name exists in ONE city only.
+const PLACE_KINDS = new Set(["suburb", "neighbourhood", "quarter"]);
+const sameName = (a: string, b: string) => { const x = cityKey(a), y = cityKey(b); const strip = (k: string) => /^[ומלבה]/.test(k) ? k.slice(1) : k; return x === y || strip(x) === y || x === strip(y); };
+export async function strictPick(phrase: string, features: PhotonFeature[], officialNames: string[]) {
+  const allowed = features.filter((f) => {
+    const p = f.properties ?? {};
+    const k = String(p["osm_key"] ?? ""), v = String(p["osm_value"] ?? "");
+    return k !== "building" && !(k === "amenity" && (v === "school" || v === "college" || v === "kindergarten"));
+  });
+  const pick = photonPick(phrase, allowed, officialNames);
+  if (!pick) return null;
+  const streets = await getStreetIndex();
+  if (streets.has(cityKey(phrase))) return null;
+  if (phrase.trim().split(/\s+/).length >= 2) return pick;
+  const sameNamed = allowed.filter((f) => typeof f.properties?.["name"] === "string" && sameName(phrase, String(f.properties["name"])));
+  const kindsOk = sameNamed.length > 0 && sameNamed.every((f) => String(f.properties?.["osm_key"]) === "place" && PLACE_KINDS.has(String(f.properties?.["osm_value"])));
+  const cities = new Set(sameNamed.map((f) => String(f.properties?.["city"] ?? f.properties?.["locality"] ?? f.properties?.["district"] ?? f.properties?.["county"] ?? "")));
+  return kindsOk && cities.size === 1 ? pick : null;
+}
+
 async function photonStep(officialNames: string[]) {
   const phrase = lookupQueue.shift();
   if (!phrase) return null;
@@ -129,7 +152,7 @@ async function photonStep(officialNames: string[]) {
   const res = await fetch(`${PHOTON_URL}?${params}`, { headers: { "User-Agent": "wa-selector-worker/1.0" }, signal: AbortSignal.timeout(8_000) });
   if (!res.ok) { lookupKeys?.delete(key); throw new Error(`photon ${res.status}`); }
   const json = (await res.json()) as { features?: PhotonFeature[] };
-  const pick = photonPick(phrase, json.features ?? [], officialNames);
+  const pick = await strictPick(phrase, json.features ?? [], officialNames);
   const status = await rpc<string>("worker_lookup_result", { p_key: key, p_phrase: phrase, p_official: pick?.official_name ?? null, p_detail: pick?.detail ?? null });
   if (pick && status === "matched") { log("auto alias:", phrase, "→", pick.official_name); if (configCache) configCache.at = 0; }
   return pick;
