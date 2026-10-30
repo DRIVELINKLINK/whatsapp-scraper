@@ -160,7 +160,7 @@ async function photonStep(officialNames: string[]) {
 
 // ---------- One cycle ----------
 type Msg = { id: string; split_of: string | null; group_id: string | null; group_name: string | null; body: string | null; timestamp: string | null; sender: string | null; sender_id: string | null; sender_name: string | null; sender_phone: string | null; account: string | null; type: string | null; from_me: boolean | null; is_duplicate: boolean };
-type Override = { message_id: string; origin: string | null; destination: string | null; phone_choice: string | null; dismissed_at: string | null; dismiss_kind?: string | null; auto_dismiss_skip?: boolean | null; price: number | null; ride_time: string | null; notes: string | null; phone: string | null; wa_link: string | null; tg_link: string | null; approved_at: string | null };
+type Override = { message_id: string; origin: string | null; destination: string | null; phone_choice: string | null; dismissed_at: string | null; dismiss_kind?: string | null; auto_dismiss_skip?: boolean | null; price: number | null; ride_time: string | null; notes: string | null; phone: string | null; wa_link: string | null; tg_link: string | null; approved_at: string | null; edited_at?: string | null };
 type Transfer = { message_id: string; status: string; attempts: number };
 
 // Parse results per message (re-parsed only when the message, its override or the settings change).
@@ -310,6 +310,9 @@ async function writeBoard(rows: BoardSource[], dl: DlOptions) {
   }
   if (prune) boardPrunedAt = Date.now();
 }
+
+const waitsForApproval = (o: Override | undefined) =>
+  Boolean(o?.edited_at && (!o.approved_at || Date.parse(o.approved_at) < Date.parse(o.edited_at)));
 
 // ---------- Two loops: "process" (read, parse, split, remove, queue) and "send" (one ride every INTERVAL) ----------
 // Sending never waits for the heavy processing, so the gap between rides stays exactly INTERVAL.
@@ -464,8 +467,10 @@ async function processInner() {
       singlePlaceUnsure,
       priceUnsure: row.ride.priceUnsure && row.ride.price === null,
       notesLineCount: row.ride.notesLines.length,
-      internalConflict: row.ride.internalConflict, overridePhone: row.override?.phone ?? null, adminApproved: Boolean(row.override?.approved_at),
+      internalConflict: row.ride.internalConflict, overridePhone: row.override?.phone ?? null, adminApproved: Boolean(row.override?.approved_at) && !waitsForApproval(row.override),
     });
+    // A ride edited by hand goes to Transfer only after "אשר" (approved after the last edit).
+    if (waitsForApproval(row.override)) { a.status = "check"; a.checkReason = "תוקן — ממתין לאישור"; }
     const streetsHere = streetPhrases(row.ride).filter((p) => { const c = streets.get(cityKey(p)); return Boolean(c?.length && ((origin && c.includes(origin)) || (destination && c.includes(destination)))); });
     const value = { message: row.message, ride: row.ride, groupName: row.groupName, origin, destination, pickupAddress, phone: a.phone, linkContact: a.linkContact, status: a.status, checkReason: a.checkReason,
       streets: streetsHere, splitPart: splitPart(row.message.id, row.message.split_of, siblings),
@@ -584,6 +589,14 @@ if (process.env.WORKER_NO_LOOP !== "1") (async function main() {
     }
   };
   // Sign of life once a minute (row id "worker" in wa_status) with speed numbers.
+  // Cleanup loop: once a day, delete messages, corrections, sends and empty lookups older than 20 days.
+  const cleanupLoop = async () => {
+    for (;;) {
+      try { log("cleanup:", JSON.stringify(await rpc("worker_cleanup", { p_days: 20 }))); }
+      catch (e) { log("cleanup failed:", String(e instanceof Error ? e.message : e)); }
+      await sleep(24 * 60 * 60_000);
+    }
+  };
   const beatLoop = async () => {
     for (;;) {
       await sb("wa_status?on_conflict=id", { method: "POST", headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
@@ -599,5 +612,5 @@ if (process.env.WORKER_NO_LOOP !== "1") (async function main() {
       await sleep(3_000);
     }
   };
-  await Promise.all([processLoop(), sendLoop(), beatLoop(), photonLoop()]);
+  await Promise.all([processLoop(), sendLoop(), beatLoop(), photonLoop(), cleanupLoop()]);
 })();
