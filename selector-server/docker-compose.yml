@@ -11,6 +11,9 @@ services:
     volumes:
       - ./data:/data
     shm_size: "1gb"
+    # Memory ceiling for Chrome: if it grows past this, Chrome is restarted by itself instead of slowing the whole server.
+    mem_limit: 2500m
+    memswap_limit: 2500m
     logging:
       driver: json-file
       options: { max-size: "10m", max-file: "3" }
@@ -23,3 +26,15 @@ services:
     logging:
       driver: json-file
       options: { max-size: "10m", max-file: "3" }
+
+  # Watchdog: push alerts (ntfy app) when WhatsApp / collector / worker / messages / memory / disk have a problem.
+  monitor:
+    build: ./monitor
+    restart: unless-stopped
+    init: true
+    env_file: .env
+    mem_limit: 128m
+    depends_on: [collector]
+    logging:
+      driver: json-file
+      options: { max-size: "5m", max-file: "2" }

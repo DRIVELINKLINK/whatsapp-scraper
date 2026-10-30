@@ -60,7 +60,11 @@ function startQrServer() {
 }
 
 let context = null;
+// Nightly restart of Chrome (default 04:00 Israel time) so its memory does not creep up over days.
+// The WhatsApp session stays on disk (no new QR), and on start the extension re-sends the last 24h, so nothing is lost.
+const RESTART_HOUR = Number(process.env.RESTART_HOUR ?? 4);
 async function run() {
+  const startedAt = Date.now();
   if (context) { await context.close().catch(() => {}); context = null; }
   buildExtension();
   fs.mkdirSync(PROFILE, { recursive: true });
@@ -82,6 +86,11 @@ async function run() {
   let lastConnected = 0;
   for (;;) {
     if (dead || page.isClosed()) throw new Error(dead || "page closed");
+    if (RESTART_HOUR >= 0 && new Date().getHours() === RESTART_HOUR && Date.now() - startedAt > 2 * 3600_000) {
+      console.log(new Date().toISOString(), "nightly restart of Chrome");
+      setState("loading", "הפעלה לילית של כרום");
+      return;
+    }
     const connected = await page.locator("#pane-side").count().catch(() => 0);
     if (connected) {
       lastConnected = Date.now();
@@ -101,6 +110,6 @@ startQrServer();
 (async function loop() {
   for (;;) {
     try { await run(); } catch (e) { setState("error", String(e && e.message || e).slice(0, 200)); console.error(e); }
-    await new Promise((r) => setTimeout(r, 15000)); // restart the browser after a failure
+    await new Promise((r) => setTimeout(r, 15000)); // restart the browser after a failure / nightly restart
   }
 })();
