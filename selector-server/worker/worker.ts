@@ -44,6 +44,7 @@ type WorkerConfig = {
   settings: { auto_transfer: boolean; auto_transfer_since: string | null; notes_template?: string | null } | null;
   keywords: PhoneKeyword[];
   note_filters: NoteFilter[];
+  parse_words?: ParseWord[];
 };
 async function sbAll<T>(path: string): Promise<T[]> {
   const out: T[] = [];
@@ -181,7 +182,8 @@ async function loadMessages(ids: string[], from: string): Promise<Msg[]> {
   return [...msgCache.values()].sort((a, b) => (b.timestamp ?? "").localeCompare(a.timestamp ?? ""));
 }
 
-let configCache: { at: number; aliasRows: PlaceAlias[]; customPlaces: { name: string }[]; keywords: PhoneKeyword[]; noteFilters: NoteFilter[] } | null = null;
+type ParseWord = { kind: "passengers" | "luggage" | "female" | "internal"; phrase: string };
+let configCache: { at: number; aliasRows: PlaceAlias[]; customPlaces: { name: string }[]; keywords: PhoneKeyword[]; noteFilters: NoteFilter[]; parseWords: ParseWord[] } | null = null;
 async function loadConfig() {
   if (configCache && Date.now() - configCache.at < CONFIG_MS) return configCache;
   const [aliasRows, customPlaces, worker] = await Promise.all([
@@ -194,7 +196,8 @@ async function loadConfig() {
   configCache = {
     at: Date.now(), aliasRows, customPlaces,
     keywords: keywordRows.filter((k) => k.kind === "dispatcher" || k.kind === "ignore"),
-    noteFilters: filterRows.filter((f) => f.kind === "line" || f.kind === "link"),
+    noteFilters: filterRows.filter((f) => f.kind === "line" || f.kind === "link" || (f.kind as string) === "label"),
+    parseWords: (worker.parse_words ?? []).filter((w) => ["passengers", "luggage", "female", "internal"].includes(w.kind)),
   };
   return configCache;
 }
@@ -250,6 +253,7 @@ async function writeBoard(rows: BoardSource[], notesTemplate: string | null, ali
       passengers: r.ride.passengers ?? null, luggage: r.ride.luggage ?? null, female_driver: Boolean(r.ride.femaleDriver),
       notes: payload.notes, body: r.message.body, status: r.status, check_reason: r.checkReason,
       is_duplicate: r.message.is_duplicate, dup_of: r.message.dup_of, dismissed: r.dismissed || Boolean(overrideCache.get(r.message.id)?.dismissed_at),
+      dismiss_kind: overrideCache.get(r.message.id)?.dismissed_at ? overrideCache.get(r.message.id)?.dismiss_kind ?? "manual" : null,
       payload: { ...payload, notes: payload.notes.slice(0, 2000), original_text: payload.original_text.slice(0, 10000), pickup_city_display: payload.pickup_city_display.slice(0, 80), dest_city_display: payload.dest_city_display.slice(0, 80) },
     };
     const hash = JSON.stringify(row);
@@ -313,12 +317,12 @@ async function processInner() {
   if (!messages.length) return { messages: 0 };
   stats.readMs = Date.now() - t0;
   const { aliasRows, customPlaces, keywords, noteFilters } = config;
-  const parseOptions: PlaceOptions = { aliases: aliasRows, official: place.official.length ? place.official : undefined, custom: customPlaces, keywords, noteFilters };
+  const parseOptions = { aliases: aliasRows, official: place.official.length ? place.official : undefined, custom: customPlaces, keywords, noteFilters, parseWords: config.parseWords } as PlaceOptions;
   const byId = new Map(messages.map((m) => [m.id, m]));
 
   // buildBase (same as useRideBoard)
   // Re-parse only when the content of the settings changes (not on every minute's reload).
-  const configKey = JSON.stringify([aliasRows, customPlaces, keywords, noteFilters, place.official.length]);
+  const configKey = JSON.stringify([aliasRows, customPlaces, keywords, noteFilters, config.parseWords, place.official.length]);
   const base = messages.map((message) => {
     const o = overrideMap.get(message.id);
     const parent = message.split_of ? byId.get(message.split_of) : null;
