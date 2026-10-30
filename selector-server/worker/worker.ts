@@ -143,6 +143,8 @@ type Transfer = { message_id: string; status: string; attempts: number };
 // Parse results per message (re-parsed only when the message, its override or the settings change).
 type BaseRow = { message: Msg; ride: ReturnType<typeof parseRide>; override: Override | undefined; multiRideCount: number; inheritedPhoneAmbiguous: boolean; groupName: string; origin: string | null; destination: string | null };
 const baseCache = new Map<string, { key: string; value: BaseRow }>();
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const finishCache = new Map<string, { key: string; value: any }>();
 
 // ---------- Incremental loading (keeps Supabase traffic small) ----------
 const FULL_MESSAGES_MS = 30 * 60_000;
@@ -234,15 +236,25 @@ async function loadTransfers() {
 
 // ---------- Ride board (wa_ride_board): the website shows what the server decided ----------
 const boardHash = new Map<string, string>();
+// Inputs of each board row; when they did not change, the row (and its DriveLink payload) is reused as is.
+const boardInputs = new Map<string, { key: string; payload: ReturnType<typeof toDriveLinkRide> }>();
+type DlOptions = NonNullable<Parameters<typeof toDriveLinkRide>[1]>;
 let boardPrunedAt = 0;
 type BoardSource = Parameters<typeof toDriveLinkRide>[0] & { status: string; checkReason: string | null; dismissed: boolean; message: { id: string; timestamp: string | null; body: string | null; sender_name: string | null; sender_phone?: string | null; split_of?: string | null; is_duplicate: boolean; dup_of: string | null } };
-async function writeBoard(rows: BoardSource[], notesTemplate: string | null, aliases: PlaceAlias[]) {
+async function writeBoard(rows: BoardSource[], dl: DlOptions) {
+  const aliases = dl.aliases ?? [];
+  const optionsKey = JSON.stringify(dl);
   const changed: Record<string, unknown>[] = [];
   const seen = new Set<string>();
   for (const r of rows) {
     if (!r.message.timestamp) continue;
     seen.add(r.message.id);
-    const payload = toDriveLinkRide(r, { notesTemplate, aliases });
+    const dismissedNow = r.dismissed || Boolean(overrideCache.get(r.message.id)?.dismissed_at);
+    const inputKey = JSON.stringify([optionsKey, baseCache.get(r.message.id)?.key ?? r.message.body, r.status, r.checkReason, r.phone, r.linkContact, r.origin, r.destination, r.pickupAddress, r.streets, r.splitPart, r.groupName, r.message.is_duplicate, r.message.dup_of, dismissedNow, overrideCache.get(r.message.id)?.dismiss_kind ?? null]);
+    const prev = boardInputs.get(r.message.id);
+    if (prev && prev.key === inputKey) continue;
+    const payload = toDriveLinkRide(r, dl);
+    boardInputs.set(r.message.id, { key: inputKey, payload: { ...payload, notes: payload.notes.slice(0, 2000), original_text: payload.original_text.slice(0, 10000), pickup_city_display: payload.pickup_city_display.slice(0, 80), dest_city_display: payload.dest_city_display.slice(0, 80) } });
     const row = {
       message_id: r.message.id, message_ts: r.message.timestamp, split_of: r.message.split_of ?? null,
       group_name: r.groupName, sender_name: r.message.sender_name, sender_phone: r.message.sender_phone ?? null,
@@ -262,13 +274,14 @@ async function writeBoard(rows: BoardSource[], notesTemplate: string | null, ali
     changed.push(row);
   }
   for (const id of boardHash.keys()) if (!seen.has(id)) boardHash.delete(id);
+  for (const id of boardInputs.keys()) if (!seen.has(id)) boardInputs.delete(id);
   const prune = Date.now() - boardPrunedAt > 10 * 60_000;
   if (!changed.length && !prune) return;
   for (let i = 0; i < Math.max(changed.length, 1); i += 300) {
     try {
       await rpc("worker_board_upsert", { p_rows: changed.slice(i, i + 300), p_prune_before: prune && i === 0 ? new Date(Date.now() - 26 * 60 * 60_000).toISOString() : null });
     } catch (e) {
-      for (const r of changed.slice(i, i + 300)) boardHash.delete(String(r["message_id"])); // retry next cycle
+      for (const r of changed.slice(i, i + 300)) { boardHash.delete(String(r["message_id"])); boardInputs.delete(String(r["message_id"])); } // retry next cycle
       throw e;
     }
   }
@@ -393,7 +406,14 @@ async function processInner() {
 
   // finish (same as useRideBoard) + status
   const finished = [];
+  const siblingCount = new Map<string, number>();
+  for (const m of messages) if (m.split_of) siblingCount.set(m.split_of, (siblingCount.get(m.split_of) ?? 0) + 1);
   for (const row of base) {
+    // Re-assess only when the message, its override, the settings or the street list changed.
+    const siblings = row.message.split_of ? siblingCount.get(row.message.split_of) ?? 0 : 0;
+    const fkey = `${baseCache.get(row.message.id)?.key ?? ""}|${streets.size}|${siblings}`;
+    const hit = finishCache.get(row.message.id);
+    if (hit && hit.key === fkey) { finished.push({ ...hit.value, message: row.message }); continue; }
     const origin = row.origin;
     let destination = row.destination;
     let singlePlaceUnsure = row.ride.singlePlaceUnsure && !row.destination;
@@ -424,12 +444,14 @@ async function processInner() {
       internalConflict: row.ride.internalConflict, overridePhone: row.override?.phone ?? null, adminApproved: Boolean(row.override?.approved_at),
     });
     const streetsHere = streetPhrases(row.ride).filter((p) => { const c = streets.get(cityKey(p)); return Boolean(c?.length && ((origin && c.includes(origin)) || (destination && c.includes(destination)))); });
-    const siblings = row.message.split_of ? messages.filter((m) => m.split_of === row.message.split_of).length : 0;
-    finished.push({ message: row.message, ride: row.ride, groupName: row.groupName, origin, destination, pickupAddress, phone: a.phone, linkContact: a.linkContact, status: a.status, checkReason: a.checkReason,
+    const value = { message: row.message, ride: row.ride, groupName: row.groupName, origin, destination, pickupAddress, phone: a.phone, linkContact: a.linkContact, status: a.status, checkReason: a.checkReason,
       streets: streetsHere, splitPart: splitPart(row.message.id, row.message.split_of, siblings),
       approved: Boolean(row.override?.approved_at), multiRides: new Array(row.multiRideCount).fill(0),
-      dismissed: Boolean(row.override?.dismissed_at), splitParent: row.multiRideCount >= 2 || row.override?.dismiss_kind === "split" });
+      dismissed: Boolean(row.override?.dismissed_at), splitParent: row.multiRideCount >= 2 || row.override?.dismiss_kind === "split" };
+    finishCache.set(row.message.id, { key: fkey, value });
+    finished.push(value);
   }
+  for (const id of finishCache.keys()) if (!byId.has(id)) finishCache.delete(id);
   // Duplicate = same dispatcher name + phone (or link) + origin + destination + price (app's markDuplicates);
   // a value missing in both counts as equal. Split parents never take part.
   const splitIds = new Set([...overrideCache.values()].filter((o) => o.dismiss_kind === "split").map((o) => o.message_id));
@@ -443,7 +465,8 @@ async function processInner() {
     log("auto removed:", toDismiss.length, "rides");
   }
   // ---- Ride board for the website: only rows that changed are written (the Transfer page reads this table).
-  await writeBoard(marked.filter((r) => !r.splitParent), settings?.notes_template ?? null, aliasRows);
+  const dlOptions: DlOptions = { notesTemplate: settings?.notes_template ?? null, aliases: aliasRows, parseWords: config.parseWords, noteFilters } as DlOptions;
+  await writeBoard(marked.filter((r) => !r.splitParent), dlOptions);
 
   if (!sending) { readyQueue = []; stats.queue = 0; return { messages: messages.length, split: splitCount, removed: toDismiss.length, skipped: "auto transfer is off" }; }
 
@@ -459,7 +482,7 @@ async function processInner() {
   }
   // Oldest waiting ride first, so nothing is starved behind newer messages.
   ready.sort((a, b) => (a.message.timestamp ?? "").localeCompare(b.message.timestamp ?? ""));
-  readyQueue = ready.map((r) => toDriveLinkRide(r, { notesTemplate: settings?.notes_template ?? null, aliases: aliasRows }))
+  readyQueue = ready.map((r) => boardInputs.get(r.message.id)?.payload ?? toDriveLinkRide(r, dlOptions))
     // DriveLink limits (notes 2000, original text 10000, names 80): never let a long template reject a ride.
     .map((b) => ({ ...b, notes: b.notes.slice(0, 2000), original_text: b.original_text.slice(0, 10000), pickup_city_display: b.pickup_city_display.slice(0, 80), dest_city_display: b.dest_city_display.slice(0, 80) }));
   stats.queue = readyQueue.length;

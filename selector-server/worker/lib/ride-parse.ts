@@ -3,7 +3,9 @@ import { cityKey } from "./city-match";
 
 export type PhoneKeyword = { phrase: string; kind: "dispatcher" | "ignore" };
 export type PlaceAlias = { alias: string; official_name: string; is_display: boolean; keep_in_notes: boolean; use_for_parse?: boolean; is_hero?: boolean };
-export type NoteFilter = { phrase: string; kind: "line" | "link" };
+export type NoteFilter = { phrase: string; kind: "line" | "link" | "label" };
+export type ParseWordKind = "passengers" | "luggage" | "female" | "internal";
+export type ParseWord = { kind: ParseWordKind | string; phrase: string };
 export type OfficialPlace = { code: string; name: string };
 export type Ride = {
   isRide: boolean;
@@ -32,7 +34,7 @@ export type Ride = {
 
 export const DEFAULT_PHONE_KEYWORDS: PhoneKeyword[] = [
   ...["לבקש פה", "לבקש במס", "לבקש ב", "לפנות למס", "לפנות ל", "להתקשר", "לתיאום"].map((phrase) => ({ phrase, kind: "dispatcher" as const })),
-  ...["מספרי הפצה", "לצרף", "צרפו"].map((phrase) => ({ phrase, kind: "ignore" as const })),
+  ...["מספרי הפצה", "מספר הפצה", "לצרף", "צרפו"].map((phrase) => ({ phrase, kind: "ignore" as const })),
 ];
 
 export type PlaceOptions = {
@@ -41,14 +43,32 @@ export type PlaceOptions = {
   custom?: { name: string }[] | undefined;
   keywords?: PhoneKeyword[] | undefined;
   noteFilters?: NoteFilter[] | undefined;
+  /** Admin-editable recognition words (wa_parse_words); a missing/empty kind uses today's words. */
+  parseWords?: ParseWord[] | undefined;
 };
 
 const INVISIBLE = /[​-‏‪-‮⁠-⁩﻿¹²³⁰-⁹]/g;
 const LINK = /(?:https?:\/\/)?(?:www\.)?(?:wa\.me\/|api\.whatsapp\.com\/send|t\.me\/)[^\s]*|https?:\/\/[^\s]+/gi;
-const LINK_LABEL = /(?:ווצאפ|וואצאפ|וואטסאפ|ווטסאפ|ווטצאפ|טלגרם)?[\s*_~:\-\p{So}\p{Extended_Pictographic}️]*(?=\u0000)/gu;
+/** Default "word before a link" labels (note filters of kind 'label'). */
+export const DEFAULT_LINK_LABELS = ["ווצאפ", "וואצאפ", "וואטסאפ", "ווטסאפ", "ווטצאפ", "טלגרם"];
+const escapeRe = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const labelPattern = (labels: string[]) => new RegExp(`(?:${labels.map(escapeRe).join("|")})?[\\s*_~:\\-\\p{So}\\p{Extended_Pictographic}\\uFE0F]*(?=\\u0000)`, "gu");
+const DEFAULT_LINK_LABEL = labelPattern(DEFAULT_LINK_LABELS);
+const labelCache = new Map<string, RegExp>();
+/** Label regex for the 'label' note filters; the 6 default words when none are given. */
+function linkLabel(filters: NoteFilter[] | undefined): RegExp {
+  const labels = [...new Set((filters ?? []).filter(f => f.kind === "label").map(f => f.phrase.trim()).filter(Boolean))].sort((a, b) => b.length - a.length);
+  if (!labels.length) return DEFAULT_LINK_LABEL;
+  const key = labels.join("\u0001");
+  let re = labelCache.get(key);
+  if (!re) { re = labelPattern(labels); labelCache.set(key, re); }
+  return re;
+}
 const SYMBOLS = /[*_~\p{So}\p{Extended_Pictographic}️⃣\u{1F3FB}-\u{1F3FF}]+/gu;
-/** Removes invisible chars, links (with their label words) and decoration. */
-const clean = (text: string) => text.replace(INVISIBLE, "").replace(LINK, "\u0000").replace(LINK_LABEL, "").replace(/\u0000/g, " ").replace(SYMBOLS, " ");
+/** Notes/display cleaning: removes invisible chars, links (with their label words) and decoration. */
+const clean = (text: string, label: RegExp = DEFAULT_LINK_LABEL) => text.replace(INVISIBLE, "").replace(LINK, "\u0000").replace(label, "").replace(/\u0000/g, " ").replace(SYMBOLS, " ");
+/** Detection cleaning: keeps every word (labels included); strips invisible chars, links and symbols only. */
+const cleanKeep = (text: string) => text.replace(INVISIBLE, "").replace(LINK, " ").replace(SYMBOLS, " ");
 const trimLink = (raw: string) => {
   const link = raw.replace(/[*_~.,;:!?)\]]+$/, "");
   return /^https?:\/\//i.test(link) ? link : `https://${link}`;
@@ -86,13 +106,15 @@ export function normalizePhone(phone: string): string | null {
   if (/^0[1-9]\d{7}$/.test(digits)) return `${digits.slice(0, 2)}-${digits.slice(2)}`;
   return null;
 }
-/** Built-in distribution markers: always "ignore", whatever the admin list contains. */
+/** Fallback distribution markers, used only when the keyword list has no "ignore" phrases (they live in the DB now). */
 export const BUILTIN_IGNORE_PHRASES = ["מספרי הפצה", "מספר הפצה", "לצרף", "צרפו"];
-/** Symbols, asterisks, emoji and repeated spaces never affect keyword matching. */
-export const keywordNorm = (value: string) => clean(value).replace(/[^\p{L}\p{N}\s'"׳״]/gu, " ").replace(/\s+/g, " ").trim();
+/** Symbols, asterisks, emoji and repeated spaces never affect keyword matching; label words are kept. */
+export const keywordNorm = (value: string) => cleanKeep(value).replace(/[^\p{L}\p{N}\s'"׳״]/gu, " ").replace(/\s+/g, " ").trim();
 const phraseHit = (line: string, phrase: string) => { const p = keywordNorm(phrase); return Boolean(p) && ` ${keywordNorm(line)} `.includes(p); };
+/** Fallback only: off as soon as the keyword list itself holds any of these ignore phrases (the DB rows). */
+const builtinIgnoreActive = (keywords: PhoneKeyword[]) => !keywords.some(k => k.kind === "ignore" && BUILTIN_IGNORE_PHRASES.includes(keywordNorm(k.phrase)));
 export function hasPhrase(line: string, keywords: PhoneKeyword[], kind?: PhoneKeyword["kind"]): boolean {
-  if ((!kind || kind === "ignore") && BUILTIN_IGNORE_PHRASES.some(phrase => phraseHit(line, phrase))) return true;
+  if ((!kind || kind === "ignore") && builtinIgnoreActive(keywords) && BUILTIN_IGNORE_PHRASES.some(phrase => phraseHit(line, phrase))) return true;
   return keywords.some((keyword) => (!kind || keyword.kind === kind) && phraseHit(line, keyword.phrase));
 }
 /** Phone from a wa.me / api.whatsapp.com link (972… → 05…), else null. */
@@ -113,7 +135,7 @@ export function stripPhoneNumbers(text: string): string {
 /** Distribution blocks are not candidates for ride contact approval. */
 export function rideTextPhones(text: string, keywords: PhoneKeyword[]): string[] {
   const phones: string[] = [];
-  for (const line of clean(text).split(/\r?\n/)) {
+  for (const line of cleanKeep(text).split(/\r?\n/)) {
     if (hasPhrase(line, keywords, "ignore")) break;
     for (const raw of line.match(phonePattern()) ?? []) {
       const phone = normalizePhone(raw);
@@ -134,7 +156,7 @@ export function extractDispatcherPhone(text: string, keywords: PhoneKeyword[]): 
   for (let i = 0; i < lines.length; i++) {
     if (!hasPhrase(lines[i] ?? "", keywords, "dispatcher")) continue;
     for (const j of [i, i + 1, i - 1]) {
-      const phone = clean(lines[j] ?? "").match(phonePattern())?.[0];
+      const phone = cleanKeep(lines[j] ?? "").match(phonePattern())?.[0];
       if (phone) return normalizePhone(phone);
     }
   }
@@ -203,31 +225,80 @@ function matchCity(words: string[], index: number, lookup: Lookup): { city: stri
 export function isValidRidePrice(amount: number): boolean {
   return Number.isInteger(amount) && amount >= 20 && amount <= 2000 && amount % 10 === 0;
 }
+export const DEFAULT_PARSE_WORDS: Record<ParseWordKind, string[]> = {
+  passengers: ["מקומות", "מקום", "נוסעים", "נוסע", "מק'", "מק׳", "מק’"],
+  luggage: ["מזוודות", "מזוודה", "מזוודה גדולה", "ג", "ק"],
+  female: ["נהגת"],
+  internal: ["פ", "פ'", "פ׳", "פנימי"],
+};
+type WordRules = { passenger: RegExp; luggage: RegExp; female: RegExp; markers: Set<string>; fullMarkers: Set<string>; restPassenger: RegExp; restLuggage: RegExp; restFemale: RegExp; restInternal: RegExp };
+const letters = (word: string) => (word.match(/\p{L}/gu) ?? []).length;
+const alt = (words: string[]) => [...words].sort((a, b) => b.length - a.length).map(w => escapeRe(w).replace(/\s+/g, "\\s+")).join("|");
+// Today's exact patterns: the default behaviour stays byte-for-byte identical.
+const DEFAULT_RULES: WordRules = {
+  passenger: /(?<![\d\p{L}])(?:(\d+)\s*(?:מקומות|מקום|נוסעים|נוסע|מק['׳’])|(?:נוסע|מקום)\s+אחד)(?![\p{L}\d])/gu,
+  luggage: /(?<![\d\p{L}])(?:(\d+)\s*מזוודות|מזוודה(?:\s+גדולה)?|(\d+)\s*[גק])(?![\p{L}\d])/gu,
+  female: /(?<![\p{L}])נהגת(?![\p{L}])/u,
+  markers: new Set(DEFAULT_PARSE_WORDS.internal), fullMarkers: new Set(["פנימי"]),
+  restPassenger: /(?<![\d\p{L}])(?:\d+\s*(?:מקומות|מקום|נוסעים|נוסע|מק['׳’])|(?:נוסע|מקום)\s+אחד|נוסעת\s+אחת)(?![\p{L}\d])/gu,
+  restLuggage: /(?<![\d\p{L}])(?:\d+\s*מזוודות|מזוודה(?:\s+גדולה)?|\d+\s*[גק])(?![\p{L}\d])/gu,
+  restFemale: /(?<![\p{L}])נהגת(?![\p{L}])/gu,
+  restInternal: /(?<![\p{L}])(?:פנימי|פ['׳]?)(?![\p{L}])/gu,
+};
+const rulesCache = new WeakMap<object, WordRules>();
+/** Recognition rules from wa_parse_words; each empty/missing kind falls back to today's words. */
+export function wordRules(parseWords: ParseWord[] | undefined): WordRules {
+  if (!parseWords?.length) return DEFAULT_RULES;
+  const cached = rulesCache.get(parseWords);
+  if (cached) return cached;
+  const of = (kind: ParseWordKind) => [...new Set(parseWords.filter(w => w.kind === kind).map(w => w.phrase.trim()).filter(Boolean))];
+  const p = of("passengers"), l = of("luggage"), f = of("female"), m = of("internal");
+  const rules: WordRules = { ...DEFAULT_RULES };
+  if (p.length) {
+    rules.passenger = new RegExp(`(?<![\\d\\p{L}])(?:(\\d+)\\s*(?:${alt(p)})|(?:${alt(p)})\\s+אחד)(?![\\p{L}\\d])`, "gu");
+    rules.restPassenger = new RegExp(`(?<![\\d\\p{L}])(?:\\d+\\s*(?:${alt(p)})|(?:${alt(p)})\\s+אחד|נוסעת\\s+אחת)(?![\\p{L}\\d])`, "gu");
+  }
+  if (l.length) {
+    const long = l.filter(w => letters(w) >= 2);
+    const alone = long.length ? `|(?:${alt(long)})` : "";
+    rules.luggage = new RegExp(`(?<![\\d\\p{L}])(?:(\\d+)\\s*(?:${alt(l)})${alone})(?![\\p{L}\\d])`, "gu");
+    rules.restLuggage = new RegExp(`(?<![\\d\\p{L}])(?:\\d+\\s*(?:${alt(l)})${alone})(?![\\p{L}\\d])`, "gu");
+  }
+  if (f.length) { rules.female = new RegExp(`(?<![\\p{L}])(?:${alt(f)})(?![\\p{L}])`, "u"); rules.restFemale = new RegExp(`(?<![\\p{L}])(?:${alt(f)})(?![\\p{L}])`, "gu"); }
+  if (m.length) {
+    rules.markers = new Set(m); rules.fullMarkers = new Set(m.filter(w => letters(w) >= 2));
+    rules.restInternal = new RegExp(`(?<![\\p{L}])(?:${alt(m)})(?![\\p{L}])`, "gu");
+  }
+  rulesCache.set(parseWords, rules);
+  return rules;
+}
 /** Metadata is extracted independently; its numbers are masked only in price scanning. */
-export function rideExtras(text: string) {
+export function rideExtras(text: string, options: Pick<PlaceOptions, "parseWords"> = {}) {
+  const rules = wordRules(options.parseWords);
   const normalized = clean(text);
-  const passengerPattern = /(?<![\d\p{L}])(?:(\d+)\s*(?:מקומות|מקום|נוסעים|נוסע|מק['׳’])|(?:נוסע|מקום)\s+אחד)(?![\p{L}\d])/gu;
-  const luggagePattern = /(?<![\d\p{L}])(?:(\d+)\s*מזוודות|מזוודה(?:\s+גדולה)?|(\d+)\s*[גק])(?![\p{L}\d])/gu;
   let passengers: number | null = null;
   let luggage: number | null = null;
-  const masked = normalized.replace(passengerPattern, (_match, count: string | undefined) => {
-    passengers ??= count ? Number(count) : 1; return " ".repeat(_match.length);
-  }).replace(luggagePattern, (_match, count: string | undefined, short: string | undefined) => {
-    luggage = (luggage ?? 0) + Number(count ?? short ?? 1); return " ".repeat(_match.length);
+  const firstNumber = (groups: unknown[]) => { const n = groups.find((g): g is string => typeof g === "string" && /^\d+$/.test(g)); return n === undefined ? null : Number(n); };
+  const masked = normalized.replace(rules.passenger, (match: string, ...groups: unknown[]) => {
+    passengers ??= firstNumber(groups) ?? 1; return " ".repeat(match.length);
+  }).replace(rules.luggage, (match: string, ...groups: unknown[]) => {
+    luggage = (luggage ?? 0) + (firstNumber(groups) ?? 1); return " ".repeat(match.length);
   });
-  return { passengers, luggage, femaleDriver: /(?<![\p{L}])נהגת(?![\p{L}])/u.test(normalized), masked };
+  return { passengers, luggage, femaleDriver: rules.female.test(normalized), masked };
 }
 export function parseRide(text: string, options: PlaceOptions | PhoneKeyword[] = {}): Ride {
   const placeOptions: PlaceOptions = Array.isArray(options) ? { keywords: options } : options;
   const keywords = placeOptions.keywords ?? DEFAULT_PHONE_KEYWORDS;
   const lookup = buildLookup(placeOptions);
   const noteFilters = placeOptions.noteFilters ?? [];
+  const rules = wordRules(placeOptions.parseWords);
+  const label = linkLabel(noteFilters);
   const links = extractLinks(text, noteFilters);
-  const { passengers, luggage, femaleDriver } = rideExtras(text);
+  const { passengers, luggage, femaleDriver } = rideExtras(text, placeOptions);
   const verifiedLink = hasVerifiedDispatchLink(text, keywords, noteFilters);
   const dispatcherPhone = verifiedLink ? null : extractDispatcherPhone(text, keywords);
   // Keep an intact cleaned line for notes; use a separate token source for extraction.
-  const cleanedLines = clean(applyNoteFilters(text, noteFilters)).replace(phonePattern(), " ").split(/\r?\n/)
+  const cleanedLines = clean(applyNoteFilters(text, noteFilters), label).replace(phonePattern(), " ").split(/\r?\n/)
     .filter(line => !hasPhrase(line, keywords)).map(line => line.replace(/\s+/g, " ").trim()).filter(Boolean);
   let time: string | null = null;
   const timePattern = /(?<![\d\p{L}])(\d{1,2})[:.](\d{2})(?![\d\p{L}])/gu;
@@ -242,7 +313,7 @@ export function parseRide(text: string, options: PlaceOptions | PhoneKeyword[] =
   const currencyPattern = /(?<![\d\p{L}])(\d+(?:\.\d+)?)\s*(?:ש["״']?ח|ש|₪)(?=$|[\s,;.!?&+])/gu;
   const barePattern = /(?<![\d\p{L}.])(\d+(?:\.\d+)?)(?![\d\p{L}.])/gu;
   // Explicit currency prices win over bare numbers, regardless of line order.
-  const priceLines = withoutTimes.map(line => rideExtras(line).masked);
+  const priceLines = withoutTimes.map(line => rideExtras(line, placeOptions).masked);
   let selectedBare: { line: number; index: number; raw: string } | null = null;
   let priceLine: number | null = null;
   const sources = priceLines.map((line, li) => line.replace(currencyPattern, (match, amount: string) => {
@@ -279,14 +350,15 @@ export function parseRide(text: string, options: PlaceOptions | PhoneKeyword[] =
   let originLine: number | null = null, destinationLine: number | null = null;
   let originToken: string | null = null, destinationToken: string | null = null;
   const matchedCities: string[] = [], notesLines: string[] = [];
-  const MARKERS = new Set(["פ", "פ'", "פ׳", "פנימי"]);
+  const MARKERS = rules.markers;
   type InternalHit = { city: string; line: number; start: number; end: number; token: string; full: boolean };
   const hits: InternalHit[] = [];
   tokenLines.forEach((words, line) => words.forEach((word, i) => {
     if (!MARKERS.has(word)) return;
     const next = matchCity(words, i + 1, lookup);
-    if (next && !next.keepInNotes) hits.push({city:next.city,line,start:i,end:i+1+next.length,token:next.token,full:word === "פנימי"});
-    if (word === "פנימי") {
+    const full = rules.fullMarkers.has(word);
+    if (next && !next.keepInNotes) hits.push({city:next.city,line,start:i,end:i+1+next.length,token:next.token,full});
+    if (full) {
       for (let start = Math.max(0, i - lookup.maxWords); start < i; start++) {
         const previous = matchCity(words, start, lookup);
         if (previous && !previous.keepInNotes && start + previous.length === i) {
@@ -507,23 +579,20 @@ export function heroConflict(alias: string, official: string, aliases: PlaceAlia
 export const DEFAULT_NOTES_TEMPLATE = "{שעה} {מוצא} {יעד} {מחיר}\n{שאר ההודעה}";
 export const NOTES_PLACEHOLDERS = ["שעה","מוצא","יעד","מוצא רשמי","יעד רשמי","מחיר","סוג","מקומות","מזוודות","נהגת","כתובת איסוף","רחובות","שאר ההודעה","שולח","טלפון","טלפון שולח","קבוצה","וואטסאפ","טלגרם","תאריך","שעת הודעה","מספר בפירוק","טקסט מקורי"] as const;
 
-const escapeRe = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 /** Note lines without the recognized places, price, time, phones, links and passenger/luggage/נהגת words. */
-export function restOfMessage(ride: Pick<Ride, "notesLines" | "originToken" | "destinationToken" | "price">): string {
+export function restOfMessage(ride: Pick<Ride, "notesLines" | "originToken" | "destinationToken" | "price">, options: Pick<PlaceOptions, "parseWords" | "noteFilters"> = {}): string {
   const tokens = [ride.originToken, ride.destinationToken].filter((t): t is string => Boolean(t)).sort((a, b) => b.length - a.length);
-  const extraPatterns = [
-    /(?<![\d\p{L}])(?:\d+\s*(?:מקומות|מקום|נוסעים|נוסע|מק['׳’])|(?:נוסע|מקום)\s+אחד|נוסעת\s+אחת)(?![\p{L}\d])/gu,
-    /(?<![\d\p{L}])(?:\d+\s*מזוודות|מזוודה(?:\s+גדולה)?|\d+\s*[גק])(?![\p{L}\d])/gu,
-    /(?<![\p{L}])נהגת(?![\p{L}])/gu,
-  ];
+  const rules = wordRules(options.parseWords);
+  const extraPatterns = [rules.restPassenger, rules.restLuggage, rules.restFemale];
+  const label = linkLabel(options.noteFilters);
   return ride.notesLines.map((raw) => {
-    let line = clean(raw).replace(phonePattern(), " ");
+    let line = clean(raw, label).replace(phonePattern(), " ");
     line = line.replace(/(?<![\d\p{L}])\d{1,2}[:.]\d{2}(?![\d\p{L}])/gu, " ");
     for (const pattern of extraPatterns) line = line.replace(pattern, " ");
     if (ride.price !== null) line = line.replace(new RegExp(`(?<![\\d\\p{L}])${ride.price}(?:\\s*(?:ש["״']?ח|ש|₪))?(?![\\d\\p{L}])`, "gu"), " ");
     line = line.replace(/₪/g, " ");
     for (const token of tokens) line = line.replace(new RegExp(`(?<![\\p{L}])[ולמבה]?${escapeRe(token)}(?![\\p{L}])`, "gu"), " ");
-    line = line.replace(/(?<![\p{L}])(?:פנימי|פ['׳]?)(?![\p{L}])/gu, " ");
+    line = line.replace(rules.restInternal, " ");
     return line.replace(/[,;:!?…()\[\]{}→/\\|_~&+\-–]+/g, " ").replace(/\s+/g, " ").trim();
   }).filter((line) => /[\p{L}\p{N}]/u.test(line)).join("\n");
 }
@@ -533,7 +602,7 @@ export type RideNotesInfo = {
   pickupAddress?: string | null; streets?: string[]; messageTime?: string | null; splitPart?: string | null; originalText?: string | null;
 };
 /** Render the notes template; empty placeholders disappear, empty lines removed, double spaces collapsed. */
-export function renderRideNotes(template: string, ride: Ride, info: RideNotesInfo, aliases: PlaceAlias[]): string {
+export function renderRideNotes(template: string, ride: Ride, info: RideNotesInfo, aliases: PlaceAlias[], options: Pick<PlaceOptions, "parseWords" | "noteFilters"> = {}): string {
   const digits = (phone: string | null | undefined) => phone ? (normalizePhone(phone) ?? phone).replace(/\D/g, "") : "";
   const internal = Boolean(ride.origin && ride.origin === ride.destination);
   const linkContact = info.linkContact ?? ride.verifiedLink;
@@ -554,7 +623,7 @@ export function renderRideNotes(template: string, ride: Ride, info: RideNotesInf
     "נהגת": ride.femaleDriver ? "נהגת" : "",
     "כתובת איסוף": info.pickupAddress ?? "",
     "רחובות": streets.join(", "),
-    "שאר ההודעה": restOfMessage(ride),
+    "שאר ההודעה": restOfMessage(ride, options),
     "שולח": info.sender ?? "",
     "טלפון": phone,
     "טלפון שולח": linkContact ? "" : digits(info.senderPhone),
@@ -576,4 +645,23 @@ export function splitPart(id: string, splitOf: string | null | undefined, total:
   if (!splitOf) return null;
   const n = Number(id.slice(id.lastIndexOf("#") + 1));
   return Number.isFinite(n) && n > 0 ? `${n}/${Math.max(total, n)}` : null;
+}
+
+/** Every single-word key that can start or belong to a known place name/alias (superset for the pre-check). */
+export function placeWordKeys(options: PlaceOptions): Set<string> {
+  const keys = new Set<string>();
+  const names = [...(options.official ?? []).map(p => p.name), ...(options.custom ?? []).map(p => p.name), ...(options.aliases ?? []).map(a => a.alias)];
+  for (const name of names) for (const word of name.split(/[\s\-–־]+/)) { const key = cityKey(word); if (key) keys.add(key); }
+  return keys;
+}
+/** Cheap pre-check: text with no digit and no known place word can never be a ride (skips parseRide). */
+export function mightBeRide(text: string, placeKeys: Set<string>): boolean {
+  if (/\d/.test(text)) return true;
+  if (!placeKeys.size) return true;
+  for (const word of text.split(/[^\p{L}'"׳״]+/u)) {
+    const key = cityKey(word);
+    if (!key) continue;
+    if (placeKeys.has(key) || placeKeys.has(key.slice(1)) || placeKeys.has(key.slice(2))) return true;
+  }
+  return false;
 }

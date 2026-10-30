@@ -1,5 +1,5 @@
 // Copied from the WhatsApp Selector app (src/lib/drivelink.ts). Keep in sync.
-import { placeLabel, renderRideNotes, type PlaceAlias, type Ride, type RideNotesInfo } from "./ride-parse";
+import { placeLabel, renderRideNotes, type NoteFilter, type ParseWord, type PlaceAlias, type Ride, type RideNotesInfo } from "./ride-parse";
 /** Pure DriveLink mapping + push logic (no secrets here; the server fn supplies them). */
 export type DriveLinkRide = {
   source_ref: string; pickup_city: string; dest_city: string; pickup_city_display: string; dest_city_display: string; pickup_address: string; ride_at: string;
@@ -28,7 +28,7 @@ export type MappableRide = {
   groupName: string; origin: string | null; destination: string | null; phone: string | null; pickupAddress?: string;
   linkContact?: boolean; streets?: string[]; splitPart?: string | null;
 };
-export type DriveLinkOptions = { notesTemplate?: string | null; aliases?: PlaceAlias[] };
+export type DriveLinkOptions = { notesTemplate?: string | null; aliases?: PlaceAlias[]; parseWords?: ParseWord[]; noteFilters?: NoteFilter[] };
 const stripNoise = (line: string) => line
   .replace(/(?:https?:\/\/)?(?:wa\.me|api\.whatsapp\.com|t\.me|chat\.whatsapp\.com)\/\S*/gi, "")
   .replace(/https?:\/\/\S+/gi, "")
@@ -41,7 +41,7 @@ export function driveLinkNotes(row: MappableRide, options: DriveLinkOptions = {}
   const ride = { originToken: null, destinationToken: null, dispatcherPhone: null, verifiedLink: false, passengers: null, luggage: null, femaleDriver: false, ...row.ride, origin: row.origin, destination: row.destination ?? row.origin } as unknown as Ride;
   const info: RideNotesInfo = { sender: row.message.sender_name, senderPhone: row.message.sender_phone ?? null, phone: row.phone, group: row.groupName, pickupAddress: row.pickupAddress ?? null, streets: row.streets ?? [], messageTime: row.message.timestamp, splitPart: row.splitPart ?? null, originalText: row.message.body };
   if (row.linkContact !== undefined) info.linkContact = row.linkContact;
-  return renderRideNotes(options.notesTemplate, ride, info, options.aliases ?? []);
+  return renderRideNotes(options.notesTemplate, ride, info, options.aliases ?? [], { parseWords: options.parseWords, noteFilters: options.noteFilters });
 }
 
 export function toDriveLinkRide(row: MappableRide, options: DriveLinkOptions = {}): DriveLinkRide {
